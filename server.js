@@ -8,8 +8,8 @@ const { uploadFile, downloadFile } = require('@huggingface/hub');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const HF_TOKEN = process.env.HF_TOKEN;
-const HF_REPO = process.env.HF_REPO;
+const HF_TOKEN = "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";
+const HF_REPO = "FatCatJadis/video-storage";
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
