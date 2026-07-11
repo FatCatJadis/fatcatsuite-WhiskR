@@ -65,15 +65,22 @@ function compressVideo(inputPath, outputPath) {
     });
 }
 
-// 1. GET ALL IDS
+// 1. FIXED: GET ALL IDS (with proper inner try/catch)
 app.get('/videos/list', async (req, res) => {
     try { 
         const db = await getHFDatabase(); 
         res.status(200).json({ ids: db.idList || [] }); 
     } catch (e) { 
-        res.status(500).send("Error reading database from cloud storage."); 
+        // If the error was a 404 (database doesn't exist yet), return an empty list instead of crashing!
+        if (e.message && e.message.includes('404')) {
+            return res.status(200).json({ ids: [] });
+        }
+        
+        console.error("Endpoint crash reading list: ", e);
+        res.status(500).send("Error reading database from cloud storage: " + e.message); 
     }
 });
+
 
 // 2. GET FILE AS DATAURI
 app.get('/video/:id/datauri', async (req, res) => {
