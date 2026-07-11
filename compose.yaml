@@ -1,0 +1,7 @@
+services:
+  video-receiver:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./uploads:/app/uploads
