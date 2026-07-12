@@ -11,6 +11,12 @@ const PORT = process.env.PORT || 3000;
 const HF_TOKEN = "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";
 const HF_REPO = "FatCatJadis/video-storage";
 
+console.log("=========================================");
+console.log("SERVER STARTING UP...");
+console.log("READING HF_REPO VALUE:", HF_REPO);
+console.log("IS HF_TOKEN DEFINED?:", HF_TOKEN ? "YES" : "NO");
+console.log("=========================================");
+
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
