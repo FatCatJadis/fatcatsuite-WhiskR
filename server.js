@@ -51,9 +51,18 @@ if (!HF_TOKEN || !HF_REPO) {
 async function initGitRepo() {
   // Clone or initialize the HF dataset repo
   if (fs.existsSync(TEMP_DIR)) {
-    // Repo already exists, but ensure git config is set
+    // Repo already exists, but ensure git config is set and remote is correct
     await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+    
+    // Verify remote is set
+    try {
+      await execAsync(`cd ${TEMP_DIR} && git remote get-url origin`, { timeout: 5000 });
+    } catch {
+      // Remote doesn't exist, add it
+      const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+      await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
+    }
     return;
   }
 
@@ -65,17 +74,12 @@ async function initGitRepo() {
     console.warn("Could not clone repo (might be empty):", err.message);
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 
   // Always set git config (for both cloned and newly initialized repos)
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-  
-  // If we're initializing a new repo, add the remote
-  if (!fs.existsSync(path.join(TEMP_DIR, ".git/config"))) {
-    const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
-    await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
-  }
 }
 
 async function gitCommitAndPush(filePath, message) {
@@ -87,14 +91,33 @@ async function gitCommitAndPush(filePath, message) {
 
   try {
     await execAsync(`cd ${TEMP_DIR} && git add "${filePath}"`, { timeout: 10000 });
+    console.log(`Added ${filePath} to git`);
+    
     await execAsync(`cd ${TEMP_DIR} && git commit -m "${message}"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 60000 });
-    console.log(`✓ Pushed ${filePath} to HF`);
-  } catch (err) {
-    // "nothing to commit" is fine; some other errors are not
-    if (!err.message.includes("nothing to commit") && !err.message.includes("no changes added")) {
-      throw err;
+    console.log(`Committed ${filePath}`);
+    
+    // Push to HuggingFace
+    try {
+      const result = await execAsync(`cd ${TEMP_DIR} && git push origin main 2>&1`, { timeout: 60000 });
+      console.log(`✓ Pushed ${filePath} to HF`);
+    } catch (pushErr) {
+      // Check the error message
+      const errMsg = (pushErr.message || "") + (pushErr.stdout || "") + (pushErr.stderr || "");
+      if (errMsg.includes("nothing to commit") || errMsg.includes("up to date")) {
+        console.log(`${filePath} already up to date`);
+        return;
+      }
+      throw new Error(`Git push failed for ${filePath}: ${errMsg.substring(0, 200)}`);
     }
+    
+  } catch (err) {
+    // "nothing to commit" errors during commit are also fine
+    if (err.message && (err.message.includes("nothing to commit") || err.message.includes("no changes added"))) {
+      console.log(`No changes to commit for ${filePath}`);
+      return;
+    }
+    console.error(`Git error for ${filePath}:`, err.message);
+    throw err;
   }
 }
 
