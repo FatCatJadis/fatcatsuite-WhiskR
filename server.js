@@ -10,8 +10,8 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 // PURE HARDCODED STRINGS (Bypasses all SDKs)
 // ==========================================
-const HF_TOKEN = "YOUR_ACTUAL_HUGGING_FACE_TOKEN_HERE"; 
-const HF_REPO = "YOUR_USERNAME/YOUR_DATASET_NAME_HERE";
+const HF_TOKEN = "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"; 
+const HF_REPO = "FatCatJadis/video-storage";
 // ==========================================
 
 console.log("=========================================");
