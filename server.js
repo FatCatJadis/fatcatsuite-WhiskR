@@ -15,7 +15,7 @@ const HF_REPO = "FatCatJadis/video-storage";
 // ==========================================
 
 console.log("=========================================");
-console.log("SERVER INITIALIZING WITH PURE WEB FETCH INTERFACE...");
+console.log("SERVER INITIALIZING WITH MODERN ASYNC FLOW...");
 console.log("TARGET REPO PATH:", HF_REPO);
 console.log("=========================================");
 
@@ -36,6 +36,20 @@ if (!fs.existsSync(tmpDir)) {
 
 function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
+}
+
+// Reusable async function to handle background video compression tasks cleanly
+function compressVideoAsync(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const command = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${outputPath}" -y`;
+        exec(command, (error, stdout, stderr) => {
+            if (error) {
+                console.error("FFmpeg background execution failed:", stderr);
+                return reject(error);
+            }
+            resolve(outputPath);
+        });
+    });
 }
 
 // Manual Fetch implementation to pull down database.json using hardcoded text URL
@@ -115,7 +129,7 @@ app.get('/video/:id/datauri', async (req, res) => {
     }
 });
 
-// 3. POST UPLOAD
+// 3. POST UPLOAD (Clean, sequential async execution layout)
 app.post('/upload', async (req, res) => {
     const { videoData, thumbnailData } = req.body;
     if (!videoData) return res.status(400).send('Missing videoData payload.');
@@ -125,60 +139,62 @@ app.post('/upload', async (req, res) => {
     const compressedPath = path.join(tmpDir, `compressed-${runId}.mp4`);
 
     try {
+        // Fetch the remote database object cleanly up front
         const db = await getHFDatabaseManual();
 
         const videoMatches = videoData.match(/^data:video\/([a-zA-Z0-9]+);base64,(.+)$/);
         if (!videoMatches || videoMatches.length !== 3) return res.status(400).send('Invalid video DataURI.');
 
-        const videoExt = videoMatches;
-        const base64VideoData = videoMatches;
+        const videoExt = videoMatches[1];
+        const base64VideoData = videoMatches[2];
         const videoBuffer = Buffer.from(base64VideoData, 'base64');
         
+        // 1. Write original video file to server disk temporarily
         fs.writeFileSync(inputPath, videoBuffer);
 
-        return new Promise((resolve, reject) => {
-            const command = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${compressedPath}" -y`;
-            exec(command, async (error) => {
-                if (error) return reject(error);
-                try {
-                    const compressedBuffer = fs.readFileSync(compressedPath);
-                    const videoId = generateVideoId();
-                    const videoFilename = `video-${runId}.mp4`;
-                    
-                    // Upload Compressed Video
-                    await uploadToHFManual(`videos/${videoFilename}`, compressedBuffer);
+        // 2. Await the async compression process
+        console.log("Compressing video stream pipeline...");
+        await compressVideoAsync(inputPath, compressedPath);
 
-                    // Upload Optional Thumbnail
-                    let thumbnailFilename = null;
-                    if (thumbnailData) {
-                        const thumbMatches = thumbnailData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
-                        if (thumbMatches && thumbMatches.length === 3) {
-                            const thumbExt = thumbMatches;
-                            const thumbBuffer = Buffer.from(thumbMatches, 'base64');
-                            thumbnailFilename = `thumb-${runId}.${thumbExt}`;
-                            await uploadToHFManual(`thumbnails/${thumbnailFilename}`, thumbBuffer);
-                        }
-                    }
+        // 3. Load the shrunken file binary buffer back into memory
+        const compressedBuffer = fs.readFileSync(compressedPath);
+        const videoId = generateVideoId();
+        const videoFilename = `video-${runId}.mp4`;
+        
+        // 4. Stream Compressed Video to Hugging Face
+        console.log("Uploading shrunken asset to Hugging Face LFS system...");
+        await uploadToHFManual(`videos/${videoFilename}`, compressedBuffer);
 
-                    // Save tracking details
-                    if (!db.idList.includes(videoId)) db.idList.push(videoId);
-                    if (!db.mappings) db.mappings = {};
-                    db.mappings[videoId] = { video: videoFilename, thumbnail: thumbnailFilename };
-                    
-                    const dbBuffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
-                    await uploadToHFManual('database.json', dbBuffer, 'application/json');
+        // 5. Check and upload optional Thumbnail data
+        let thumbnailFilename = null;
+        if (thumbnailData) {
+            const thumbMatches = thumbnailData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+            if (thumbMatches && thumbMatches.length === 3) {
+                const thumbExt = thumbMatches[1];
+                const base64ThumbData = thumbMatches[2];
+                const thumbBuffer = Buffer.from(base64ThumbData, 'base64');
+                thumbnailFilename = `thumb-${runId}.${thumbExt}`;
+                
+                await uploadToHFManual(`thumbnails/${thumbnailFilename}`, thumbBuffer);
+            }
+        }
 
-                    res.status(200).json({ message: 'Success!', id: videoId });
-                    resolve();
-                } catch (err) {
-                    reject(err);
-                }
-            });
-        });
+        // 6. Update local memory object state and sync database registry back up
+        if (!db.idList.includes(videoId)) db.idList.push(videoId);
+        if (!db.mappings) db.mappings = {};
+        db.mappings[videoId] = { video: videoFilename, thumbnail: thumbnailFilename };
+        
+        const dbBuffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
+        await uploadToHFManual('database.json', dbBuffer, 'application/json');
+
+        console.log(`Video processed and stored under ID: ${videoId}`);
+        res.status(200).json({ message: 'Success!', id: videoId });
 
     } catch (error) {
+        console.error("Pipeline failure: ", error.message);
         res.status(500).send('Server processing error: ' + error.message);
     } finally {
+        // Always execute cleanup tasks safely to prevent storage memory leakage
         [inputPath, compressedPath].forEach(filePath => {
             if (fs.existsSync(filePath)) { try { fs.unlinkSync(filePath); } catch (e) {} }
         });
