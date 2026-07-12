@@ -1,151 +1,143 @@
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { downloadFile, uploadFile } = require('@huggingface/hub');
-
-const cors = require('cors'); // <-- Add this line
-
+const express = require("express");
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: f }) => f(...args));
 const app = express();
+app.use(express.json({ limit: "500mb" }));
 
-// Increase JSON payload limits since DataURIs for video can be massive
-app.use(express.json({ limit: '500mb' }));
+const HF_TOKEN = process.env.HF_TOKEN;
+const HF_REPO = process.env.HF_DATASET_REPO; // e.g. "username/my-videos"
+const HF_API = `https://huggingface.co/api/datasets/${HF_REPO}`;
+const HF_RAW = `https://huggingface.co/datasets/${HF_REPO}/resolve/main`;
 
+// ── HuggingFace helpers ──────────────────────────────────────────────────────
+
+async function hfUpload(filePath, content, isBase64 = false) {
+  // filePath: path inside the repo, e.g. "database.json" or "media/video-123/video.mp4"
+  // content: string (for JSON) or base64 string (for binary)
+  const body = isBase64 ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+
+  const res = await fetch(
+    `https://huggingface.co/api/datasets/${HF_REPO}/upload/${encodeURIComponent(filePath)}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body,
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HF upload failed for ${filePath}: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+async function hfDownload(filePath) {
+  // Returns the raw Response; caller decides how to parse
+  const res = await fetch(`${HF_RAW}/${filePath}?raw=true`, {
+    headers: { Authorization: `Bearer ${HF_TOKEN}` },
+  });
+  return res;
+}
+
+async function getDB() {
+  const res = await hfDownload("database.json");
+  if (res.status === 404) return { ids: [], videos: {} };
+  if (!res.ok) throw new Error(`Failed to fetch database.json: ${res.status}`);
+  return res.json();
+}
+
+async function saveDB(db) {
+  await hfUpload("database.json", JSON.stringify(db, null, 2));
+}
+
+// ── Endpoints ────────────────────────────────────────────────────────────────
+
+// POST /upload
+// Body: { videoData: "data:video/mp4;base64,...", thumbnailData: "data:image/png;base64,..." }
+app.post("/upload", async (req, res) => {
+  try {
+    const { videoData, thumbnailData } = req.body;
+    if (!videoData || !thumbnailData) {
+      return res.status(400).json({ error: "videoData and thumbnailData are required" });
+    }
+
+    const timestamp = Date.now();
+    const id = `video-${timestamp}`;
+    const folder = `media/${id}`;
+
+    // Strip data URI prefix and extract base64 payload
+    const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
+    const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
+
+    // Upload files to HuggingFace
+    await hfUpload(`${folder}/video.mp4`, videoBase64, true);
+    await hfUpload(`${folder}/thumbnail.png`, thumbBase64, true);
+
+    // Update database
+    const db = await getDB();
+    db.ids.push(id);
+    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: "thumbnail.png", uploadedAt: timestamp };
+    await saveDB(db);
+
+    res.json({ id, folder });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /ids
+app.get("/ids", async (req, res) => {
+  try {
+    const db = await getDB();
+    res.json({ ids: db.ids });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /:id/video/datauri
+app.get("/:id/video/datauri", async (req, res) => {
+  try {
+    const db = await getDB();
+    const entry = db.videos[req.params.id];
+    if (!entry) return res.status(404).json({ error: "Video not found" });
+
+    const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
+    if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
+
+    const buffer = await hfRes.buffer();
+    const base64 = buffer.toString("base64");
+    res.json({ datauri: `data:video/mp4;base64,${base64}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /:id/thumbnail/datauri
+app.get("/:id/thumbnail/datauri", async (req, res) => {
+  try {
+    const db = await getDB();
+    const entry = db.videos[req.params.id];
+    if (!entry) return res.status(404).json({ error: "Video not found" });
+
+    const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
+    if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
+
+    const buffer = await hfRes.buffer();
+    const base64 = buffer.toString("base64");
+    res.json({ datauri: `data:image/png;base64,${base64}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-const HF_TOKEN = process.env.HF_TOKEN; 
-const HF_REPO = process.env.HF_REPO; // e.g., "username/my-video-dataset"
-
-// Helper function to decode DataURIs into raw binary buffers
-function decodeDataURI(dataURI) {
-    const matches = dataURI.match(/^data:(.+);base64,(.+)$/);
-    if (!matches) throw new Error('Invalid DataURI format');
-    return {
-        mimeType: matches[1],
-        buffer: Buffer.from(matches[2], 'base64')
-    };
-}
-
-// Fetches the database.json file from your HF dataset repository
-async function getDatabase() {
-    try {
-        const response = await downloadFile({
-            repo: { type: "dataset", name: HF_REPO },
-            path: "database.json",
-            credentials: { token: HF_TOKEN }
-        });
-        const text = await response.text();
-        return JSON.parse(text);
-    } catch (error) {
-        // If the file doesn't exist yet, return a fresh empty array template
-        return [];
-    }
-}
-
-// Commits a file buffer directly to your Hugging Face dataset repository
-async function uploadToHF(repoPath, buffer) {
-    await uploadFile({
-        repo: { type: "dataset", name: HF_REPO },
-        path: repoPath,
-        file: new Blob([buffer]),
-        credentials: { token: HF_TOKEN }
-    });
-}
-
-app.post('/upload', async (req, res) => {
-    try {
-        const { videoData, thumbnailData } = req.body;
-        if (!videoData || !thumbnailData) {
-            return res.status(400).json({ error: "Missing videoData or thumbnailData" });
-        }
-
-        const timestamp = Date.now();
-        const videoId = `vid-${timestamp}`;
-
-        // 1. Decode DataURIs into raw binary buffers
-        const videoDecoded = decodeDataURI(videoData);
-        const thumbDecoded = decodeDataURI(thumbnailData);
-
-        // 2. Define remote folder paths matching your structure
-        const videoPath = `media/video-${timestamp}/video.mp4`;
-        const thumbPath = `media/video-${timestamp}/thumbnail.png`;
-
-        // 3. Directly stream the files to Hugging Face
-        await uploadToHF(videoPath, videoDecoded.buffer);
-        await uploadToHF(thumbPath, thumbDecoded.buffer);
-
-        // 4. Download, update, and upload the synchronized database.json
-        const db = await getDatabase();
-        const newEntry = {
-            id: videoId,
-            filename: videoPath,
-            thumbnailPath: thumbPath
-        };
-        db.push(newEntry);
-
-        const updatedDbBuffer = Buffer.from(JSON.stringify(db, null, 2));
-        await uploadToHF("database.json", updatedDbBuffer);
-
-        res.status(201).json({ message: "Upload successful!", id: videoId });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Upload failed", details: error.message });
-    }
-});
-
-app.get('/ids', async (req, res) => {
-    try {
-        const db = await getDatabase();
-        res.status(200).json(db);
-    } catch (error) {
-        res.status(500).json({ error: "Failed to retrieve IDs" });
-    }
-});
-
-// GET Video DataURI
-app.get('/:id/video/datauri', async (req, res) => {
-    try {
-        const db = await getDatabase();
-        const record = db.find(item => item.id === req.params.id);
-        
-        if (!record) return res.status(404).json({ error: "Video ID not found" });
-
-        const response = await downloadFile({
-            repo: { type: "dataset", name: HF_REPO },
-            path: record.filename,
-            credentials: { token: HF_TOKEN }
-        });
-        
-        const arrayBuffer = await response.arrayBuffer();
-        const base64 = Buffer.from(arrayBuffer).toString('base64');
-        
-        res.status(200).json({ videoData: `data:video/mp4;base64,${base64}` });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to fetch video data" });
-    }
-});
-
-// GET Thumbnail DataURI
-app.get('/:id/thumbnail/datauri', async (req, res) => {
-    try {
-        const db = await getDatabase();
-        const record = db.find(item => item.id === req.params.id);
-        
-        if (!record) return res.status(404).json({ error: "Video ID not found" });
-
-        const response = await downloadFile({
-            repo: { type: "dataset", name: HF_REPO },
-            path: record.thumbnailPath,
-            credentials: { token: HF_TOKEN }
-        });
-        
-        const arrayBuffer = await response.arrayBuffer();
-        const base64 = Buffer.from(arrayBuffer).toString('base64');
-        
-        res.status(200).json({ thumbnailData: `data:image/png;base64,${base64}` });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to fetch thumbnail data" });
-    }
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server handling storage via HuggingFace running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
