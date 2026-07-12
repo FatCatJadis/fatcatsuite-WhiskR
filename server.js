@@ -123,6 +123,15 @@ async function gitCommitAndPush(filePath, message) {
     console.log(`Added ${filePath} to git`);
     
     await execAsync(`cd ${TEMP_DIR} && git commit -m "${message}"`, { timeout: 10000 });
+    
+    // Pull latest from remote to avoid "non-fast-forward" errors on concurrent uploads
+    try {
+      await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
+      console.log("Synced with remote");
+    } catch (pullErr) {
+      // Pull might fail if remote is empty/new, that's okay
+      console.log("Pull skipped (remote may be new)");
+    }
     console.log(`Committed ${filePath}`);
     
     // Push to HuggingFace
