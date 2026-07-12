@@ -189,6 +189,24 @@ app.get("/ids", async (req, res) => {
   }
 });
 
+// NEW ROUTE: Returns all videos paired directly with their titles and metadata
+app.get("/feed", async (req, res) => {
+  try {
+    const db = await getDB();
+    
+    // Map the database into a clean array of objects containing the ID and its details
+    const feed = db.ids.map(id => ({
+      id: id,
+      title: db.videos[id]?.title || id, // Fallback to ID if old video lacks a title
+      uploadedAt: db.videos[id]?.uploadedAt || 0
+    }));
+    
+    res.json({ feed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /:id/video -> High Performance local disk streaming bypasses HF download walls
 app.get("/:id/video", async (req, res) => {
   try {
