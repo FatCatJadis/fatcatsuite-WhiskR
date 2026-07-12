@@ -7,7 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "@huggingface/hub": "^0.8.4"
+    "express": "^4.19.2"
   }
 }
