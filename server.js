@@ -38,7 +38,7 @@ function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
 }
 
-// BULLETPROOF RETRIEVAL: Safely manages empty repositories without causing 500 crashes
+// Dynamically creates the database download link on the fly at runtime using dashboard strings
 async function getHFDatabaseManual() {
     if (!HF_TOKEN || !HF_REPO) throw new Error("Server environment missing keys on Render dashboard.");
     
@@ -47,21 +47,11 @@ async function getHFDatabaseManual() {
         const response = await fetch(dbUrl, {
             headers: { 'Authorization': `Bearer ${HF_TOKEN}` }
         });
-        
-        // THE TRUE 500 FIX: Exit immediately using "return". Do not let the code continue down 
-        // to execute response.json() on an empty data link, which causes the thread crash.
-        if (response.status === 404) {
-            console.log("database.json not found on Hugging Face repo. Returning blank template layout.");
-            return { idList: [], mappings: {} };
-        }
-        
-        if (!response.ok) throw new Error("Cloud registry connection rejected with status: " + response.status);
-        
-        const data = await response.json();
-        return data;
+        if (response.status === 404) return { idList: [], mappings: {} };
+        if (!response.ok) throw new Error("Status code error: " + response.status);
+        return await response.json();
     } catch (e) {
-        console.warn("Hugging Face error intercept, defaulting to empty template sequence:", e.message);
-        return { idList: [], mappings: {} };
+        throw new Error(e.message);
     }
 }
 
@@ -96,7 +86,7 @@ app.get('/video/:id/datauri', async (req, res) => {
     }
 });
 
-// 3. POST UPLOAD WITH COMPRESSION
+// 3. POST UPLOAD WITH FIXED RAW DATA STRIPPING
 app.post('/upload', async (req, res) => {
     const { videoData, thumbnailData } = req.body;
     if (!videoData) return res.status(400).send('Missing videoData.');
@@ -109,7 +99,8 @@ app.post('/upload', async (req, res) => {
     try {
         const db = await getHFDatabaseManual();
 
-        // FIXED: Extract index 1 of the split array string cleanly
+        // FIXED: Extract explicitly index element [1] from the split operation array 
+        // to pass raw text instead of passing a whole array object block down to the Buffer
         const videoParts = videoData.split(',');
         const videoRawBase64 = videoParts.length > 1 ? videoParts[1] : videoParts[0];
         fs.writeFileSync(inputPath, Buffer.from(videoRawBase64, 'base64'));
@@ -167,6 +158,7 @@ app.post('/upload', async (req, res) => {
         console.error("Pipeline failure event log:", error.message);
         res.status(500).send('Pipeline Error: ' + error.message);
     } finally {
+        // Always execute clean up tasks safely to prevent storage memory leakage inside Render container
         [inputPath, compressedPath].forEach(p => { if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch(e){} } });
     }
 });
