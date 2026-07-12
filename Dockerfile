@@ -1,7 +1,11 @@
 FROM node:20-alpine
+
+# Securely install FFmpeg system utilities inside the container
+RUN apk add --no-cache ffmpeg
+
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
-COPY server.js .    <-- THIS LINE
+COPY server.js .
 EXPOSE 3000
 CMD ["npm", "start"]
