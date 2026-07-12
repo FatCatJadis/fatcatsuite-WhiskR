@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: video-receiver
+    runtime: docker
+    repo: https://github.com # <-- Replace with your real GitHub repo link!
+    plan: free
+    envVars:
+      - key: HF_TOKEN
+        sync: false # Tells Render to look up the secure value from your dashboard vault
+      - key: HF_REPO
+        value: whiskr/video-receiver # Pre-filled with your real repo path
