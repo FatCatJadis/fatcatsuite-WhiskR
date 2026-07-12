@@ -1,3 +1,6 @@
+// Force Node to prefer standard IPv4 routing to prevent Render container network dropouts
+require('dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -7,9 +10,14 @@ const { exec } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// SECURE LOOKUPS: Pulls directly from Render's hidden dashboard memory
+// SECURE LOOKUPS: Pulls directly from Render's hidden dashboard memory at runtime
 const HF_TOKEN = process.env.HF_TOKEN; 
 const HF_REPO  = process.env.HF_REPO;  
+
+console.log("=========================================");
+console.log("SERVER INITIALIZING IN SECURE RUNTIME MODE...");
+console.log("TARGET REPO FROM ENVIRONMENT:", HF_REPO || "NOT CONFIGURED YET");
+console.log("=========================================");
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -30,9 +38,9 @@ function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
 }
 
-// Dynamically creates the database download link on the fly at runtime
+// Dynamically creates the database download link on the fly at runtime using dashboard strings
 async function getHFDatabaseManual() {
-    if (!HF_TOKEN || !HF_REPO) throw new Error("Server environment missing keys.");
+    if (!HF_TOKEN || !HF_REPO) throw new Error("Server environment missing keys on Render dashboard.");
     
     const dbUrl = `https://huggingface.co{HF_REPO}/raw/main/database.json`;
     try {
@@ -82,7 +90,7 @@ app.get('/video/:id/datauri', async (req, res) => {
 app.post('/upload', async (req, res) => {
     const { videoData, thumbnailData } = req.body;
     if (!videoData) return res.status(400).send('Missing videoData.');
-    if (!HF_TOKEN || !HF_REPO) return res.status(500).send('Server configuration missing.');
+    if (!HF_TOKEN || !HF_REPO) return res.status(500).send('Server configuration missing keys.');
 
     const runId = Date.now();
     const inputPath = path.join(tmpDir, `input-${runId}.tmp`);
@@ -91,12 +99,12 @@ app.post('/upload', async (req, res) => {
     try {
         const db = await getHFDatabaseManual();
 
-        // Safe extraction of base64 chunks
-        const videoRawBase64 = videoData.split(',')[1];
-        if (!videoRawBase64) return res.status(400).send('Invalid video format.');
+        // Safe split extraction to clean off the DataURI header if passed
+        const videoParts = videoData.split(',');
+        const videoRawBase64 = videoParts.length > 1 ? videoParts[1] : videoParts[0];
         fs.writeFileSync(inputPath, Buffer.from(videoRawBase64, 'base64'));
 
-        // Run background video compression task sequentially
+        // Run background video compression task sequentially using FFmpeg
         await new Promise((resolve, reject) => {
             const cmd = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${compressedPath}" -y`;
             exec(cmd, (err) => err ? reject(err) : resolve());
@@ -117,16 +125,16 @@ app.post('/upload', async (req, res) => {
         // Upload Thumbnail optionally if provided
         let thumbnailFilename = null;
         if (thumbnailData) {
-            const thumbRawBase64 = thumbnailData.split(',')[1];
-            if (thumbRawBase64) {
-                thumbnailFilename = `thumb-${runId}.png`;
-                const thumbUrl = `https://huggingface.co{HF_REPO}/upload/main/thumbnails/${thumbnailFilename}`;
-                await fetch(thumbUrl, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${HF_TOKEN}`, 'Content-Type': 'application/octet-stream' },
-                    body: Buffer.from(thumbRawBase64, 'base64')
-                });
-            }
+            const thumbParts = thumbnailData.split(',');
+            const thumbRawBase64 = thumbParts.length > 1 ? thumbParts[1] : thumbParts[0];
+            thumbnailFilename = `thumb-${runId}.png`;
+            const thumbUrl = `https://huggingface.co{HF_REPO}/upload/main/thumbnails/${thumbnailFilename}`;
+            
+            await fetch(thumbUrl, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${HF_TOKEN}`, 'Content-Type': 'application/octet-stream' },
+                body: Buffer.from(thumbRawBase64, 'base64')
+            });
         }
 
         // Merge tracking indices
@@ -146,8 +154,10 @@ app.post('/upload', async (req, res) => {
         res.status(200).json({ message: 'Success!', id: videoId });
 
     } catch (error) {
+        console.error("Pipeline failure event log:", error.message);
         res.status(500).send('Pipeline Error: ' + error.message);
     } finally {
+        // Always execute clean up tasks safely to prevent storage memory leakage inside Render container
         [inputPath, compressedPath].forEach(p => { if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch(e){} } });
     }
 });
