@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install git (needed for pushing to HuggingFace)
 RUN apt-get update && apt-get install -y git git-lfs
-RUN apk add --no-cache git
+
 
 COPY package.json ./
 RUN npm install --production
