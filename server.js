@@ -3,14 +3,16 @@ const fs = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
-const multer = require("multer"); // Added for multipart form streams
+const multer = require("multer"); // CRITICAL: Added to handle binary file fields
 
 const execAsync = promisify(exec);
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
-const upload = multer({ dest: "/tmp/uploads/" }); // Directs streams safely to disk
+
+// Safe storage allocation that captures chunks directly onto disk
+const upload = multer({ dest: "/tmp/uploads/" });
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -20,7 +22,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// JSON body parsing is kept only for other standard routes, not file uploads
+// Reduced down to 10mb because large files stream through multer, not JSON
 app.use(express.json({ limit: "10mb" }));
 
 app.use((err, req, res, next) => {
@@ -121,14 +123,14 @@ async function saveDB(db) {
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
 
-// POST /upload (Handles streaming chunks directly onto disk)
+// POST /upload -> Processes multipart files independently
 app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thumbnail", maxCount: 1 }]), async (req, res) => {
   try {
     const hasVideo = req.files && req.files.video && req.files.video[0];
     const hasThumbnail = req.files && req.files.thumbnail && req.files.thumbnail[0];
 
     if (!hasVideo && !hasThumbnail) {
-      return res.status(400).json({ error: "No files sent. Provide a 'video', a 'thumbnail', or both." });
+      return res.status(400).json({ error: "Payload empty. Provide a 'video', a 'thumbnail', or both." });
     }
 
     await initGitRepo();
@@ -144,7 +146,7 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
       const rawVideo = req.files.video[0];
       const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
       fs.mkdirSync(path.dirname(videoPath), { recursive: true });
-      fs.renameSync(rawVideo.path, videoPath); // Safe stream movement
+      fs.renameSync(rawVideo.path, videoPath); // Relocates file chunk stream safely
       await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
     }
 
@@ -177,12 +179,12 @@ app.get("/ids", async (req, res) => {
   }
 });
 
-// Streams video directly back instead of using high-RAM dataURIs
+// GET endpoints now stream binary directly back rather than converting to heavy dataURIs
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.videoFile) return res.status(404).json({ error: "Video file not found." });
+    if (!entry || !entry.videoFile) return res.status(404).json({ error: "No video file found for this entry." });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
@@ -201,7 +203,7 @@ app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.thumbnailFile) return res.status(404).json({ error: "Thumbnail file not found." });
+    if (!entry || !entry.thumbnailFile) return res.status(404).json({ error: "No thumbnail file found for this entry." });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
