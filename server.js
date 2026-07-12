@@ -3,26 +3,20 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
-const { uploadFile, downloadFile } = require('@huggingface/hub');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// FORCED EXPLICIT CREDENTIAL BINDING
+// PURE HARDCODED STRINGS (Bypasses all SDKs)
 // ==========================================
-const MY_CREDENTIALS = {
-    token: "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"
-};
-const MY_REPO = { 
-    type: 'dataset', 
-    id: "FatCatJadis/video-storage" 
-};
+const HF_TOKEN = "YOUR_ACTUAL_HUGGING_FACE_TOKEN_HERE"; 
+const HF_REPO = "YOUR_USERNAME/YOUR_DATASET_NAME_HERE";
 // ==========================================
 
 console.log("=========================================");
-console.log("SERVER BOOTING WITH SECURE HUB MAPPINGS...");
-console.log("TARGET REPO ARCHITECTURE:", MY_REPO.id);
+console.log("SERVER INITIALIZING WITH PURE WEB FETCH INTERFACE...");
+console.log("TARGET REPO PATH:", HF_REPO);
 console.log("=========================================");
 
 app.use((req, res, next) => {
@@ -44,43 +38,57 @@ function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
 }
 
-// FIXED: Bypasses SDK environment lookups completely
-async function getHFDatabase() {
+// Manual Fetch implementation to pull down database.json using hardcoded text URL
+async function getHFDatabaseManual() {
+    const url = `https://huggingface.co{HF_REPO}/raw/main/database.json`;
     try {
-        const response = await downloadFile({
-            repo: MY_REPO,
-            path: 'database.json',
-            credentials: MY_CREDENTIALS
+        const response = await fetch(url, {
+            headers: { 'Authorization': `Bearer ${HF_TOKEN}` }
         });
-        const text = await response.text();
-        return JSON.parse(text);
-    } catch (e) {
-        if (e.status === 404 || (e.message && e.message.includes('404'))) {
-            console.log("First launch database tracking file generated.");
+        
+        if (response.status === 404) {
+            console.log("No remote database tracking file found. Starting fresh.");
             return { idList: [], mappings: {} };
         }
-        console.error("SDK Download link aborted safely:", e.message);
-        throw new Error(e.message);
+        
+        if (!response.ok) {
+            throw new Error(`API returned error status: ${response.status}`);
+        }
+        
+        return await response.json();
+    } catch (e) {
+        console.error("Direct fetch retrieval error:", e.message);
+        throw e;
     }
 }
 
-function compressVideo(inputPath, outputPath) {
-    return new Promise((resolve, reject) => {
-        const command = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${outputPath}" -y`;
-        exec(command, (error, stdout, stderr) => {
-            if (error) return reject(error);
-            resolve(outputPath);
-        });
+// Manual Fetch implementation to push files up to Hugging Face
+async function uploadToHFManual(filePath, fileBuffer, contentType = 'application/octet-stream') {
+    const url = `https://huggingface.co{HF_REPO}/upload/main/${filePath}`;
+    
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${HF_TOKEN}`,
+            'Content-Type': contentType
+        },
+        body: fileBuffer
     });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Hugging Face upload failed for ${filePath}: ${errText}`);
+    }
+    return true;
 }
 
 // 1. GET ALL IDS
 app.get('/videos/list', async (req, res) => {
     try { 
-        const db = await getHFDatabase(); 
+        const db = await getHFDatabaseManual(); 
         res.status(200).json({ ids: db.idList || [] }); 
     } catch (e) { 
-        res.status(500).send("Error reading database tracking: " + e.message); 
+        res.status(500).send("Error reading tracking registry: " + e.message); 
     }
 });
 
@@ -88,16 +96,18 @@ app.get('/videos/list', async (req, res) => {
 app.get('/video/:id/datauri', async (req, res) => {
     const videoId = req.params.id;
     try {
-        const db = await getHFDatabase();
+        const db = await getHFDatabaseManual();
         const meta = db.mappings[videoId];
         if (!meta || !meta.video) return res.status(404).send('Video ID not found.');
         
-        const response = await downloadFile({
-            repo: MY_REPO, 
-            path: `videos/${meta.video}`, 
-            credentials: MY_CREDENTIALS
+        const fileUrl = `https://huggingface.co{HF_REPO}/raw/main/videos/${meta.video}`;
+        const fileResponse = await fetch(fileUrl, {
+            headers: { 'Authorization': `Bearer ${HF_TOKEN}` }
         });
-        const arrayBuffer = await response.arrayBuffer();
+
+        if (!fileResponse.ok) return res.status(404).send('Physical file missing from storage.');
+
+        const arrayBuffer = await fileResponse.arrayBuffer();
         const fileBuffer = Buffer.from(arrayBuffer);
         res.status(200).json({ dataURI: `data:video/mp4;base64,${fileBuffer.toString('base64')}` });
     } catch (e) { 
@@ -115,60 +125,56 @@ app.post('/upload', async (req, res) => {
     const compressedPath = path.join(tmpDir, `compressed-${runId}.mp4`);
 
     try {
-        const db = await getHFDatabase();
+        const db = await getHFDatabaseManual();
 
         const videoMatches = videoData.match(/^data:video\/([a-zA-Z0-9]+);base64,(.+)$/);
         if (!videoMatches || videoMatches.length !== 3) return res.status(400).send('Invalid video DataURI.');
 
-        const videoExt = videoMatches[1];
-        const base64VideoData = videoMatches[2];
+        const videoExt = videoMatches;
+        const base64VideoData = videoMatches;
         const videoBuffer = Buffer.from(base64VideoData, 'base64');
         
         fs.writeFileSync(inputPath, videoBuffer);
-        await compressVideo(inputPath, compressedPath);
 
-        const compressedBuffer = fs.readFileSync(compressedPath);
-        const videoId = generateVideoId();
-        const videoFilename = `video-${runId}.mp4`;
-        
-        await uploadFile({
-            repo: MY_REPO,
-            credentials: MY_CREDENTIALS,
-            path: `videos/${videoFilename}`,
-            file: new Blob([compressedBuffer])
+        return new Promise((resolve, reject) => {
+            const command = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${compressedPath}" -y`;
+            exec(command, async (error) => {
+                if (error) return reject(error);
+                try {
+                    const compressedBuffer = fs.readFileSync(compressedPath);
+                    const videoId = generateVideoId();
+                    const videoFilename = `video-${runId}.mp4`;
+                    
+                    // Upload Compressed Video
+                    await uploadToHFManual(`videos/${videoFilename}`, compressedBuffer);
+
+                    // Upload Optional Thumbnail
+                    let thumbnailFilename = null;
+                    if (thumbnailData) {
+                        const thumbMatches = thumbnailData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+                        if (thumbMatches && thumbMatches.length === 3) {
+                            const thumbExt = thumbMatches;
+                            const thumbBuffer = Buffer.from(thumbMatches, 'base64');
+                            thumbnailFilename = `thumb-${runId}.${thumbExt}`;
+                            await uploadToHFManual(`thumbnails/${thumbnailFilename}`, thumbBuffer);
+                        }
+                    }
+
+                    // Save tracking details
+                    if (!db.idList.includes(videoId)) db.idList.push(videoId);
+                    if (!db.mappings) db.mappings = {};
+                    db.mappings[videoId] = { video: videoFilename, thumbnail: thumbnailFilename };
+                    
+                    const dbBuffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
+                    await uploadToHFManual('database.json', dbBuffer, 'application/json');
+
+                    res.status(200).json({ message: 'Success!', id: videoId });
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
+            });
         });
-
-        let thumbnailFilename = null;
-        if (thumbnailData) {
-            const thumbMatches = thumbnailData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
-            if (thumbMatches && thumbMatches.length === 3) {
-                const thumbExt = thumbMatches[1];
-                const base64ThumbData = thumbMatches[2];
-                const thumbBuffer = Buffer.from(base64ThumbData, 'base64');
-                thumbnailFilename = `thumb-${runId}.${thumbExt}`;
-
-                await uploadFile({
-                    repo: MY_REPO,
-                    credentials: MY_CREDENTIALS,
-                    path: `thumbnails/${thumbnailFilename}`,
-                    file: new Blob([thumbBuffer])
-                });
-            }
-        }
-
-        if (!db.idList.includes(videoId)) db.idList.push(videoId);
-        if (!db.mappings) db.mappings = {};
-        db.mappings[videoId] = { video: videoFilename, thumbnail: thumbnailFilename };
-        
-        const dbString = JSON.stringify(db, null, 2);
-        await uploadFile({
-            repo: MY_REPO,
-            credentials: MY_CREDENTIALS,
-            path: 'database.json',
-            file: new Blob([dbString], { type: 'application/json' })
-        });
-
-        res.status(200).json({ message: 'Success!', id: videoId });
 
     } catch (error) {
         res.status(500).send('Server processing error: ' + error.message);
@@ -179,4 +185,4 @@ app.post('/upload', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => { console.log(`Backend fully initialized on port ${PORT}`); });
+app.listen(PORT, () => { console.log(`Pure Web REST integration running on port ${PORT}`); });
