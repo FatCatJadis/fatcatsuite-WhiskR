@@ -2,7 +2,29 @@ const express = require("express");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 const app = express();
+
+// Allow requests from any origin (needed if you're calling this from a browser page)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
 app.use(express.json({ limit: "500mb" }));
+
+// Surface JSON body-parse errors (e.g. payload too large, malformed JSON) as JSON instead of hanging/crashing
+app.use((err, req, res, next) => {
+  if (err) {
+    console.error("Body parse error:", err.message);
+    return res.status(400).json({ error: `Bad request body: ${err.message}` });
+  }
+  next();
+});
+
+// Simple health check — useful to confirm the server is actually reachable
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const HF_TOKEN = process.env.HF_TOKEN;
 const HF_REPO = process.env.HF_DATASET_REPO; // e.g. "username/my-videos"
