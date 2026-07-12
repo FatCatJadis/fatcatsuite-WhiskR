@@ -19,7 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "500mb" }));
+app.use(express.json({ limit: "1gb" }));
 
 // Surface JSON body-parse errors (e.g. payload too large, malformed JSON) as JSON instead of hanging/crashing
 app.use((err, req, res, next) => {
