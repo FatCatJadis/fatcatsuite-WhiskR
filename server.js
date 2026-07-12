@@ -93,6 +93,25 @@ async function initGitRepo() {
       console.warn("Could not fetch from remote (might be new):", err.message);
     }
     return;
+
+    await execAsync(`cd ${TEMP_DIR} && git lfs install`, {
+    timeout: 10000
+});
+
+await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, {
+    timeout: 10000
+});
+
+await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, {
+    timeout: 10000
+});
+
+try {
+    await execAsync(`cd ${TEMP_DIR} && git commit -m "Enable Git LFS"`, {
+        timeout: 10000
+    });
+} catch {}
+    
   }
 
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
@@ -280,4 +299,10 @@ app.get("/:id/thumbnail/datauri", async (req, res) => {
 
 // ── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+// Allow long uploads
+server.requestTimeout = 0;
+server.headersTimeout = 0;
