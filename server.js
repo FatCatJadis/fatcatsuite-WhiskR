@@ -8,12 +8,8 @@ const { uploadFile, downloadFile } = require('@huggingface/hub');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==========================================
-// CRITICAL: HARDCODE YOUR CREDENTIALS HERE
-// ==========================================
-const HF_TOKEN = "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"; 
-const HF_REPO = "FatCatJadis/video-storage";
-// ==========================================
+const HF_TOKEN = process.env.HF_TOKEN; 
+const HF_REPO = process.env.HF_REPO;
 
 console.log("=========================================");
 console.log("SERVER BOOTING UP...");
