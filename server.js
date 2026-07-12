@@ -208,6 +208,7 @@ app.get("/feed", async (req, res) => {
 });
 
 // GET /:id/video -> High Performance local disk streaming bypasses HF download walls
+// FIXED: Supports HTTP Range Requests for instant skipping, fast-forwarding, and scrubbing
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
@@ -221,15 +222,33 @@ app.get("/:id/video", async (req, res) => {
     }
 
     const stat = fs.statSync(localFilePath);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stat.size);
+    const fileSize = stat.size;
+    const range = req.headers.range;
 
-    fs.createReadStream(localFilePath).pipe(res);
-  } catch (err) {
-    console.error("Local Video Streaming Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    // If the browser sends a Range header (i.e., user is trying to skip or buffer ahead)
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+      if (start >= fileSize) {
+        res.status(416).send("Requested range not satisfiable\n" + start + " >= " + fileSize);
+        return;
+      }
+
+      const chunksize = (end - start) + 1;
+      const file = fs.createReadStream(localFilePath, { start, end });
+      
+      // 206 Partial Content tells the browser it's getting exactly the chunk it asked for
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": "video/mp4",
+      });
+      
+      file.pipe(res);
+    }
 
 // GET /:id/thumbnail -> High Performance local image disk streaming
 app.get("/:id/thumbnail", async (req, res) => {
