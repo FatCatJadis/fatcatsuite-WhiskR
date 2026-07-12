@@ -38,7 +38,7 @@ function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
 }
 
-// Dynamically creates the database download link on the fly at runtime using dashboard strings
+// Reusable download function referencing explicit network lookups safely
 async function getHFDatabaseManual() {
     if (!HF_TOKEN || !HF_REPO) throw new Error("Server environment missing keys on Render dashboard.");
     
@@ -47,8 +47,14 @@ async function getHFDatabaseManual() {
         const response = await fetch(dbUrl, {
             headers: { 'Authorization': `Bearer ${HF_TOKEN}` }
         });
-        if (response.status === 404) return { idList: [], mappings: {} };
-        if (!response.ok) throw new Error("Status code error: " + response.status);
+        
+        // CRITICAL NESTED HANDLER: Catch 404 cleanly so a blank dataset doesn't trigger "fetch failed"
+        if (response.status === 404) {
+            console.log("Target file database.json not found on repository. Returning clean layout.");
+            return { idList: [], mappings: {} };
+        }
+        
+        if (!response.ok) throw new Error("Cloud registry link dropped with status: " + response.status);
         return await response.json();
     } catch (e) {
         throw new Error(e.message);
@@ -99,12 +105,12 @@ app.post('/upload', async (req, res) => {
     try {
         const db = await getHFDatabaseManual();
 
-        // Safe split extraction to clean off the DataURI header if passed
+        // Safe index split extraction to drop payload text headers cleanly
         const videoParts = videoData.split(',');
         const videoRawBase64 = videoParts.length > 1 ? videoParts[1] : videoParts[0];
         fs.writeFileSync(inputPath, Buffer.from(videoRawBase64, 'base64'));
 
-        // Run background video compression task sequentially using FFmpeg
+        // Handle background compression sequences sequentially via FFmpeg
         await new Promise((resolve, reject) => {
             const cmd = `ffmpeg -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -acodec aac -strict -2 "${compressedPath}" -y`;
             exec(cmd, (err) => err ? reject(err) : resolve());
@@ -137,7 +143,7 @@ app.post('/upload', async (req, res) => {
             });
         }
 
-        // Merge tracking indices
+        // Merge registry records 
         if (!db.idList.includes(videoId)) db.idList.push(videoId);
         if (!db.mappings) db.mappings = {};
         db.mappings[videoId] = { video: videoFilename, thumbnail: thumbnailFilename };
@@ -157,7 +163,6 @@ app.post('/upload', async (req, res) => {
         console.error("Pipeline failure event log:", error.message);
         res.status(500).send('Pipeline Error: ' + error.message);
     } finally {
-        // Always execute clean up tasks safely to prevent storage memory leakage inside Render container
         [inputPath, compressedPath].forEach(p => { if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch(e){} } });
     }
 });
