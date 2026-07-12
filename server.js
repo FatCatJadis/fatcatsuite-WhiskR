@@ -44,22 +44,36 @@ if (!HF_TOKEN || !HF_REPO) {
 async function hfUpload(filePath, content, isBase64 = false) {
   // filePath: path inside the repo, e.g. "database.json" or "media/video-123/video.mp4"
   // content: string (for JSON) or base64 string (for binary)
-  const body = isBase64 ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+  // Use the commit API (replaces deprecated upload endpoint)
+  
+  const buffer = isBase64 ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+  const base64Encoded = buffer.toString("base64");
+
+  const operations = [
+    {
+      operation: "add",
+      path_in_repo: filePath,
+      raw: base64Encoded,
+    },
+  ];
 
   const res = await fetch(
-    `https://huggingface.co/api/datasets/${HF_REPO}/upload/main/${encodeURIComponent(filePath)}`,
+    `https://huggingface.co/api/datasets/${HF_REPO}/commit`,
     {
       method: "POST",
       headers: {
         Authorization: `Bearer ${HF_TOKEN}`,
-        "Content-Type": "application/octet-stream",
+        "Content-Type": "application/json",
       },
-      body,
+      body: JSON.stringify({
+        commit_message: `Upload ${filePath}`,
+        operations,
+      }),
     }
   );
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`HF upload failed for ${filePath}: ${res.status} ${text}`);
+    throw new Error(`HF commit failed for ${filePath}: ${res.status} ${text}`);
   }
   return res.json();
 }
