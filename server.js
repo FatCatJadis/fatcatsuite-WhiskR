@@ -3,15 +3,13 @@ const fs = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
-const multer = require("multer"); // Added for multi-part form streaming
+const multer = require("multer"); 
 
 const execAsync = promisify(exec);
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
-
-// Configure multer to temporarily store chunks on disk instead of memory
 const upload = multer({ dest: "/tmp/uploads/" });
 
 app.use((req, res, next) => {
@@ -22,7 +20,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Standard JSON parser for small metadata payloads (keep limit reasonable)
 app.use(express.json({ limit: "10mb" }));
 
 app.use((err, req, res, next) => {
@@ -68,8 +65,6 @@ async function initGitRepo() {
   if (fs.existsSync(TEMP_DIR)) {
     await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-    
-    // Ensure Git LFS is active in this runtime instance
     await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
     
     try {
@@ -98,7 +93,6 @@ async function initGitRepo() {
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 
-  // Setup identities and Git LFS tracking
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
   
@@ -126,7 +120,6 @@ async function gitCommitAndPush(filePath, message) {
       console.log("Pull skipped (remote may be new)");
     }
     
-    // Extended timeout to 15 minutes to allow large LFS uploads over the network
     await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 900000 });
     console.log(`✓ Pushed ${filePath} to HF via Git LFS`);
     
@@ -164,11 +157,14 @@ async function saveDB(db) {
 // ── Endpoints ────────────────────────────────────────────────────────────────
 
 // POST /upload
-// Expects multipart/form-data: fields named "video" and "thumbnail" containing actual binary files
+// Handles independent files. Requires at least one or the other.
 app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thumbnail", maxCount: 1 }]), async (req, res) => {
   try {
-    if (!req.files || !req.files.video || !req.files.thumbnail) {
-      return res.status(400).json({ error: "Both video and thumbnail files are required." });
+    const hasVideo = req.files && req.files.video && req.files.video[0];
+    const hasThumbnail = req.files && req.files.thumbnail && req.files.thumbnail[0];
+
+    if (!hasVideo && !hasThumbnail) {
+      return res.status(400).json({ error: "Payload empty. Provide a 'video' file, a 'thumbnail' file, or both." });
     }
 
     await initGitRepo();
@@ -177,28 +173,32 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    const rawVideo = req.files.video[0];
-    const rawThumbnail = req.files.thumbnail[0];
+    // Dynamically flag what files were recorded
+    const videoFile = hasVideo ? "video.mp4" : null;
+    const thumbnailFile = hasThumbnail ? "thumbnail.png" : null;
 
-    const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
-    const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
-    
-    fs.mkdirSync(path.dirname(videoPath), { recursive: true });
+    if (hasVideo) {
+      const rawVideo = req.files.video[0];
+      const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
+      fs.mkdirSync(path.dirname(videoPath), { recursive: true });
+      fs.renameSync(rawVideo.path, videoPath);
+      await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
+    }
 
-    // Safely move files from temporary storage to the git repository
-    fs.renameSync(rawVideo.path, videoPath);
-    fs.renameSync(rawThumbnail.path, thumbPath);
-
-    // Push files sequentially to avoid staging conflicts
-    await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
-    await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
+    if (hasThumbnail) {
+      const rawThumbnail = req.files.thumbnail[0];
+      const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
+      fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
+      fs.renameSync(rawThumbnail.path, thumbPath);
+      await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
+    }
 
     const db = await getDB();
     db.ids.push(id);
-    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: "thumbnail.png", uploadedAt: timestamp };
+    db.videos[id] = { folder, videoFile, thumbnailFile, uploadedAt: timestamp };
     await saveDB(db);
 
-    res.json({ id, folder });
+    res.json({ id, folder, videoUploaded: hasVideo, thumbnailUploaded: hasThumbnail });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -216,12 +216,13 @@ app.get("/ids", async (req, res) => {
 });
 
 // GET /:id/video
-// Streams the binary file directly to the client instead of compiling a data URI
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Video not found" });
+    if (!entry || !entry.videoFile) {
+      return res.status(404).json({ error: "This item does not contain a video file." });
+    }
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
@@ -231,7 +232,6 @@ app.get("/:id/video", async (req, res) => {
       res.setHeader("Content-Length", hfRes.headers.get("content-length"));
     }
 
-    // Pipe the network stream straight to the client response object
     hfRes.body.pipe(res);
   } catch (err) {
     console.error(err);
@@ -244,7 +244,9 @@ app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Video not found" });
+    if (!entry || !entry.thumbnailFile) {
+      return res.status(404).json({ error: "This item does not contain a thumbnail file." });
+    }
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
