@@ -67,7 +67,7 @@ async function initGitRepo() {
 
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
   try {
-    await execAsync::(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
+    await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
   } catch (err) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
