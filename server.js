@@ -130,9 +130,10 @@ async function saveDB(db) {
 // POST /upload -> Reverted workflow accepting pure Base64 strings
 app.post("/upload", async (req, res) => {
   try {
-    const { videoData, thumbnailData } = req.body;
-    if (!videoData || !thumbnailData) {
-      return res.status(400).json({ error: "videoData and thumbnailData are required" });
+    // 1. Accept title right along with the media data streams
+    const { videoData, thumbnailData, title } = req.body;
+    if (!videoData || !thumbnailData || !title) {
+      return res.status(400).json({ error: "videoData, thumbnailData, and title are all required." });
     }
 
     await initGitRepo();
@@ -141,32 +142,43 @@ app.post("/upload", async (req, res) => {
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    // Drop regex data patterns
+    // 2. Figure out the extension of the thumbnail dynamically (png, jpg, jpeg, webp, etc)
+    const matches = thumbnailData.match(/^data:image\/([a-zA-Z0-9+.#]+);base64,/);
+    const extension = matches && matches[1] ? matches[1] : "png"; // fallback to png
+    const thumbnailFilename = `thumbnail.${extension}`;
+
+    // Clean data headers off base64 strings
     const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
     const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
     const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
-    const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
+    const thumbPath = path.join(TEMP_DIR, folder, thumbnailFilename);
     
     fs.mkdirSync(path.dirname(videoPath), { recursive: true });
     fs.writeFileSync(videoPath, Buffer.from(videoBase64, "base64"));
     fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
 
     await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
-    await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
+    await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail ${id}`);
 
+    // 3. Save title directly to database dictionary object matching your required format
     const db = await getDB();
     db.ids.push(id);
-    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: "thumbnail.png", uploadedAt: timestamp };
+    db.videos[id] = { 
+      folder, 
+      videoFile: "video.mp4", 
+      thumbnailFile: thumbnailFilename, 
+      title: title, // Appends custom title tracking metadata 
+      uploadedAt: timestamp 
+    };
     await saveDB(db);
 
-    res.json({ id, folder });
+    res.json({ id, title, folder });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
-
 // GET /ids -> Pull database directory indices
 app.get("/ids", async (req, res) => {
   try {
