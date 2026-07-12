@@ -3,14 +3,14 @@ const fs = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
-const multer = require("multer"); 
+const multer = require("multer"); // Added for multipart form streams
 
 const execAsync = promisify(exec);
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
-const upload = multer({ dest: "/tmp/uploads/" });
+const upload = multer({ dest: "/tmp/uploads/" }); // Directs streams safely to disk
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -20,6 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// JSON body parsing is kept only for other standard routes, not file uploads
 app.use(express.json({ limit: "10mb" }));
 
 app.use((err, req, res, next) => {
@@ -42,30 +43,12 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
-// Validate HF credentials at startup
-(async () => {
-  try {
-    console.log(`Testing HuggingFace access to ${HF_REPO}...`);
-    const res = await fetch(`https://huggingface.co/api/datasets/${HF_REPO}`, {
-      headers: { Authorization: `Bearer ${HF_TOKEN}` },
-    });
-    if (!res.ok) {
-      console.warn(`Warning: Could not verify HuggingFace repo access (${res.status}).`);
-    } else {
-      console.log("✓ HuggingFace credentials verified");
-    }
-  } catch (err) {
-    console.warn("Warning: Could not verify HuggingFace connection:", err.message);
-  }
-})();
-
 // ── Git + HuggingFace helpers ────────────────────────────────────────────────
 
 async function initGitRepo() {
   if (fs.existsSync(TEMP_DIR)) {
     await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
     
     try {
       await execAsync(`cd ${TEMP_DIR} && git remote get-url origin`, { timeout: 5000 });
@@ -85,9 +68,7 @@ async function initGitRepo() {
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
   try {
     await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
-    console.log("Cloned HF dataset repo");
   } catch (err) {
-    console.warn("Could not clone repo (creating new):", err.message);
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
@@ -95,14 +76,6 @@ async function initGitRepo() {
 
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-  
-  console.log("Initializing Git LFS attributes...");
-  await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
-  await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
-  await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, { timeout: 10000 });
-  try {
-    await execAsync(`cd ${TEMP_DIR} && git commit -m "Track MP4 files via Git LFS"`, { timeout: 10000 });
-  } catch (_) {}
 }
 
 async function gitCommitAndPush(filePath, message) {
@@ -116,20 +89,12 @@ async function gitCommitAndPush(filePath, message) {
     
     try {
       await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
-    } catch (pullErr) {
-      console.log("Pull skipped (remote may be new)");
-    }
+    } catch (pullErr) {}
     
-    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 900000 });
-    console.log(`✓ Pushed ${filePath} to HF via Git LFS`);
-    
+    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 90000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
-    if (errMsg.includes("nothing to commit") || errMsg.includes("no changes added") || errMsg.includes("up to date")) {
-      console.log(`No updates needed for ${filePath}`);
-      return;
-    }
-    console.error(`Git error for ${filePath}:`, err.message);
+    if (errMsg.includes("nothing to commit") || errMsg.includes("no changes added")) return;
     throw err;
   }
 }
@@ -156,15 +121,14 @@ async function saveDB(db) {
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
 
-// POST /upload
-// Handles independent files. Requires at least one or the other.
+// POST /upload (Handles streaming chunks directly onto disk)
 app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thumbnail", maxCount: 1 }]), async (req, res) => {
   try {
     const hasVideo = req.files && req.files.video && req.files.video[0];
     const hasThumbnail = req.files && req.files.thumbnail && req.files.thumbnail[0];
 
     if (!hasVideo && !hasThumbnail) {
-      return res.status(400).json({ error: "Payload empty. Provide a 'video' file, a 'thumbnail' file, or both." });
+      return res.status(400).json({ error: "No files sent. Provide a 'video', a 'thumbnail', or both." });
     }
 
     await initGitRepo();
@@ -173,7 +137,6 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    // Dynamically flag what files were recorded
     const videoFile = hasVideo ? "video.mp4" : null;
     const thumbnailFile = hasThumbnail ? "thumbnail.png" : null;
 
@@ -181,7 +144,7 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
       const rawVideo = req.files.video[0];
       const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
       fs.mkdirSync(path.dirname(videoPath), { recursive: true });
-      fs.renameSync(rawVideo.path, videoPath);
+      fs.renameSync(rawVideo.path, videoPath); // Safe stream movement
       await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
     }
 
@@ -198,7 +161,7 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
     db.videos[id] = { folder, videoFile, thumbnailFile, uploadedAt: timestamp };
     await saveDB(db);
 
-    res.json({ id, folder, videoUploaded: hasVideo, thumbnailUploaded: hasThumbnail });
+    res.json({ id, folder, videoUploaded: !!hasVideo, thumbnailUploaded: !!hasThumbnail });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -210,19 +173,16 @@ app.get("/ids", async (req, res) => {
     const db = await getDB();
     res.json({ ids: db.ids });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /:id/video
+// Streams video directly back instead of using high-RAM dataURIs
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.videoFile) {
-      return res.status(404).json({ error: "This item does not contain a video file." });
-    }
+    if (!entry || !entry.videoFile) return res.status(404).json({ error: "Video file not found." });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
@@ -231,22 +191,17 @@ app.get("/:id/video", async (req, res) => {
     if (hfRes.headers.get("content-length")) {
       res.setHeader("Content-Length", hfRes.headers.get("content-length"));
     }
-
     hfRes.body.pipe(res);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /:id/thumbnail
 app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.thumbnailFile) {
-      return res.status(404).json({ error: "This item does not contain a thumbnail file." });
-    }
+    if (!entry || !entry.thumbnailFile) return res.status(404).json({ error: "Thumbnail file not found." });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
@@ -254,7 +209,6 @@ app.get("/:id/thumbnail", async (req, res) => {
     res.setHeader("Content-Type", "image/png");
     hfRes.body.pipe(res);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
