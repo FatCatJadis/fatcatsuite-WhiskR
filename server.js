@@ -50,7 +50,12 @@ if (!HF_TOKEN || !HF_REPO) {
 
 async function initGitRepo() {
   // Clone or initialize the HF dataset repo
-  if (fs.existsSync(TEMP_DIR)) return; // Already initialized
+  if (fs.existsSync(TEMP_DIR)) {
+    // Repo already exists, but ensure git config is set
+    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+    return;
+  }
 
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
   try {
@@ -60,8 +65,15 @@ async function initGitRepo() {
     console.warn("Could not clone repo (might be empty):", err.message);
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+  }
+
+  // Always set git config (for both cloned and newly initialized repos)
+  await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
+  await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+  
+  // If we're initializing a new repo, add the remote
+  if (!fs.existsSync(path.join(TEMP_DIR, ".git/config"))) {
+    const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 }
