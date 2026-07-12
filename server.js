@@ -31,6 +31,14 @@ const HF_REPO = process.env.HF_DATASET_REPO; // e.g. "username/my-videos"
 const HF_API = `https://huggingface.co/api/datasets/${HF_REPO}`;
 const HF_RAW = `https://huggingface.co/datasets/${HF_REPO}/resolve/main`;
 
+if (!HF_TOKEN || !HF_REPO) {
+  console.error(
+    "FATAL: HF_TOKEN and/or HF_DATASET_REPO environment variables are not set. " +
+    "Set them before starting the server (e.g. in Render's dashboard under Environment)."
+  );
+  process.exit(1);
+}
+
 // ── HuggingFace helpers ──────────────────────────────────────────────────────
 
 async function hfUpload(filePath, content, isBase64 = false) {
@@ -39,7 +47,7 @@ async function hfUpload(filePath, content, isBase64 = false) {
   const body = isBase64 ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
 
   const res = await fetch(
-    `https://huggingface.co/api/datasets/${HF_REPO}/upload/${encodeURIComponent(filePath)}`,
+    `https://huggingface.co/api/datasets/${HF_REPO}/upload/main/${encodeURIComponent(filePath)}`,
     {
       method: "POST",
       headers: {
