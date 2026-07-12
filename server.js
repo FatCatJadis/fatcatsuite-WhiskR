@@ -44,8 +44,11 @@ if (!HF_TOKEN || !HF_REPO) {
 }
 
 // ── Git + HuggingFace + LFS Environment Systems ──────────────────────────────
-
+let isGitRepoInitialized = false;
 async function initGitRepo() {
+  // If another request already initialized the repo, skip the Git commands entirely!
+  if (isGitRepoInitialized) return;
+
   if (fs.existsSync(TEMP_DIR)) {
     await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
@@ -62,6 +65,8 @@ async function initGitRepo() {
     } catch (err) {
       console.warn("Could not fetch from remote:", err.message);
     }
+    
+    isGitRepoInitialized = true; // Mark as done
     return;
   }
 
@@ -88,6 +93,8 @@ async function initGitRepo() {
   } catch (lfsErr) {
     console.warn("LFS baseline track update skipped:", lfsErr.message);
   }
+
+  isGitRepoInitialized = true; // Mark as done
 }
 
 async function gitCommitAndPush(filePath, message) {
