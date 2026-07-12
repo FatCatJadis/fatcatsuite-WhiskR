@@ -46,6 +46,27 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
+// Validate HF credentials at startup
+(async () => {
+  try {
+    const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+    console.log(`Testing HuggingFace access to ${HF_REPO}...`);
+    const res = await fetch(`https://huggingface.co/api/datasets/${HF_REPO}`, {
+      headers: { Authorization: `Bearer ${HF_TOKEN}` },
+    });
+    if (!res.ok) {
+      console.warn(
+        `Warning: Could not verify HuggingFace repo access (${res.status}). ` +
+        `Check that HF_DATASET_REPO is correct and HF_TOKEN has write access.`
+      );
+    } else {
+      console.log("✓ HuggingFace credentials verified");
+    }
+  } catch (err) {
+    console.warn("Warning: Could not verify HuggingFace connection:", err.message);
+  }
+})();
+
 // ── Git + HuggingFace helpers ────────────────────────────────────────────────
 
 async function initGitRepo() {
@@ -63,6 +84,14 @@ async function initGitRepo() {
       const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
       await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
     }
+    
+    // Try to fetch to sync with remote
+    try {
+      await execAsync(`cd ${TEMP_DIR} && git fetch origin 2>&1`, { timeout: 20000 });
+      console.log("Fetched from remote");
+    } catch (err) {
+      console.warn("Could not fetch from remote (might be new):", err.message);
+    }
     return;
   }
 
@@ -71,7 +100,7 @@ async function initGitRepo() {
     await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
     console.log("Cloned HF dataset repo");
   } catch (err) {
-    console.warn("Could not clone repo (might be empty):", err.message);
+    console.warn("Could not clone repo (might be empty or new):", err.message);
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
@@ -98,7 +127,7 @@ async function gitCommitAndPush(filePath, message) {
     
     // Push to HuggingFace
     try {
-      const result = await execAsync(`cd ${TEMP_DIR} && git push origin main 2>&1`, { timeout: 60000 });
+      const result = await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 60000 });
       console.log(`✓ Pushed ${filePath} to HF`);
     } catch (pushErr) {
       // Check the error message
@@ -107,7 +136,9 @@ async function gitCommitAndPush(filePath, message) {
         console.log(`${filePath} already up to date`);
         return;
       }
-      throw new Error(`Git push failed for ${filePath}: ${errMsg.substring(0, 200)}`);
+      // Log full error for debugging
+      console.error("Full push error:", errMsg);
+      throw new Error(`Git push failed for ${filePath}: ${errMsg.substring(0, 500)}`);
     }
     
   } catch (err) {
