@@ -8,12 +8,21 @@ const { uploadFile, downloadFile } = require('@huggingface/hub');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const HF_TOKEN = process.env.HF_TOKEN; 
-const HF_REPO = process.env.HF_REPO;
+// ==========================================
+// FORCED EXPLICIT CREDENTIAL BINDING
+// ==========================================
+const MY_CREDENTIALS = {
+    token: "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"
+};
+const MY_REPO = { 
+    type: 'dataset', 
+    id: "FatCatJadis/video-storage" 
+};
+// ==========================================
 
 console.log("=========================================");
-console.log("SERVER BOOTING UP...");
-console.log("READING HF_REPO:", HF_REPO);
+console.log("SERVER BOOTING WITH SECURE HUB MAPPINGS...");
+console.log("TARGET REPO ARCHITECTURE:", MY_REPO.id);
 console.log("=========================================");
 
 app.use((req, res, next) => {
@@ -35,23 +44,23 @@ function generateVideoId() {
     return crypto.randomBytes(8).toString('base64url').substring(0, 11);
 }
 
-// FIXED: Uses the globally defined string constants exclusively
+// FIXED: Bypasses SDK environment lookups completely
 async function getHFDatabase() {
     try {
         const response = await downloadFile({
-            repo: { type: 'dataset', id: HF_REPO },
+            repo: MY_REPO,
             path: 'database.json',
-            credentials: { token: HF_TOKEN }
+            credentials: MY_CREDENTIALS
         });
         const text = await response.text();
         return JSON.parse(text);
     } catch (e) {
         if (e.status === 404 || (e.message && e.message.includes('404'))) {
-            console.log("No database.json found on Hugging Face. Creating fresh layout.");
+            console.log("First launch database tracking file generated.");
             return { idList: [], mappings: {} };
         }
-        console.error("Database download failed:", e.message);
-        throw new Error("Hugging Face database read failed: " + e.message);
+        console.error("SDK Download link aborted safely:", e.message);
+        throw new Error(e.message);
     }
 }
 
@@ -71,10 +80,7 @@ app.get('/videos/list', async (req, res) => {
         const db = await getHFDatabase(); 
         res.status(200).json({ ids: db.idList || [] }); 
     } catch (e) { 
-        if (e.message && e.message.includes('404')) {
-            return res.status(200).json({ ids: [] });
-        }
-        res.status(500).send("Error reading database from cloud storage: " + e.message); 
+        res.status(500).send("Error reading database tracking: " + e.message); 
     }
 });
 
@@ -87,15 +93,15 @@ app.get('/video/:id/datauri', async (req, res) => {
         if (!meta || !meta.video) return res.status(404).send('Video ID not found.');
         
         const response = await downloadFile({
-            repo: { type: 'dataset', id: HF_REPO }, 
+            repo: MY_REPO, 
             path: `videos/${meta.video}`, 
-            credentials: { token: HF_TOKEN }
+            credentials: MY_CREDENTIALS
         });
         const arrayBuffer = await response.arrayBuffer();
         const fileBuffer = Buffer.from(arrayBuffer);
         res.status(200).json({ dataURI: `data:video/mp4;base64,${fileBuffer.toString('base64')}` });
     } catch (e) { 
-        res.status(500).send('Error streaming file from cloud storage.'); 
+        res.status(500).send('Error streaming tracking binary: ' + e.message); 
     }
 });
 
@@ -126,8 +132,8 @@ app.post('/upload', async (req, res) => {
         const videoFilename = `video-${runId}.mp4`;
         
         await uploadFile({
-            repo: { type: 'dataset', id: HF_REPO },
-            credentials: { token: HF_TOKEN },
+            repo: MY_REPO,
+            credentials: MY_CREDENTIALS,
             path: `videos/${videoFilename}`,
             file: new Blob([compressedBuffer])
         });
@@ -142,8 +148,8 @@ app.post('/upload', async (req, res) => {
                 thumbnailFilename = `thumb-${runId}.${thumbExt}`;
 
                 await uploadFile({
-                    repo: { type: 'dataset', id: HF_REPO },
-                    credentials: { token: HF_TOKEN },
+                    repo: MY_REPO,
+                    credentials: MY_CREDENTIALS,
                     path: `thumbnails/${thumbnailFilename}`,
                     file: new Blob([thumbBuffer])
                 });
@@ -156,8 +162,8 @@ app.post('/upload', async (req, res) => {
         
         const dbString = JSON.stringify(db, null, 2);
         await uploadFile({
-            repo: { type: 'dataset', id: HF_REPO },
-            credentials: { token: HF_TOKEN },
+            repo: MY_REPO,
+            credentials: MY_CREDENTIALS,
             path: 'database.json',
             file: new Blob([dbString], { type: 'application/json' })
         });
@@ -165,7 +171,7 @@ app.post('/upload', async (req, res) => {
         res.status(200).json({ message: 'Success!', id: videoId });
 
     } catch (error) {
-        res.status(500).send('Server error: ' + error.message);
+        res.status(500).send('Server processing error: ' + error.message);
     } finally {
         [inputPath, compressedPath].forEach(filePath => {
             if (fs.existsSync(filePath)) { try { fs.unlinkSync(filePath); } catch (e) {} }
