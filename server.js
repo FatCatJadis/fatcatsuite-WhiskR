@@ -14,7 +14,7 @@ const app = express();
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.header("Access-Control-Allow-Headers", "Content-Type,Authorization,Range");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -77,11 +77,12 @@ async function initGitRepo() {
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
 
-  // Inject Git LFS patterns to make pushing scalable behind the scenes
   try {
     await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs track "*.png"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.jpg"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.jpeg"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git commit -m "Initialize Git LFS tracking rules"`, { timeout: 10000 });
   } catch (lfsErr) {
@@ -102,7 +103,6 @@ async function gitCommitAndPush(filePath, message) {
       await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
     } catch (pullErr) {}
     
-    // 120 second extended window for LFS byte processing
     await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 120000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
@@ -127,13 +127,12 @@ async function saveDB(db) {
 
 // ── Production Interface Routes ──────────────────────────────────────────────
 
-// POST /upload -> Reverted workflow accepting pure Base64 strings
+// POST /upload -> Accept title, video packet and graphic packets
 app.post("/upload", async (req, res) => {
   try {
-    // 1. Accept title right along with the media data streams
     const { videoData, thumbnailData, title } = req.body;
     if (!videoData || !thumbnailData || !title) {
-      return res.status(400).json({ error: "videoData, thumbnailData, and title are all required." });
+      return res.status(400).json({ error: "videoData, thumbnailData, and title are required." });
     }
 
     await initGitRepo();
@@ -142,12 +141,10 @@ app.post("/upload", async (req, res) => {
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    // 2. Figure out the extension of the thumbnail dynamically (png, jpg, jpeg, webp, etc)
     const matches = thumbnailData.match(/^data:image\/([a-zA-Z0-9+.#]+);base64,/);
-    const extension = matches && matches[1] ? matches[1] : "png"; // fallback to png
+    const extension = matches && matches[1] ? matches[1] : "png";
     const thumbnailFilename = `thumbnail.${extension}`;
 
-    // Clean data headers off base64 strings
     const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
     const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
@@ -161,14 +158,13 @@ app.post("/upload", async (req, res) => {
     await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
     await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail ${id}`);
 
-    // 3. Save title directly to database dictionary object matching your required format
     const db = await getDB();
     db.ids.push(id);
     db.videos[id] = { 
       folder, 
       videoFile: "video.mp4", 
       thumbnailFile: thumbnailFilename, 
-      title: title, // Appends custom title tracking metadata 
+      title: title, 
       uploadedAt: timestamp 
     };
     await saveDB(db);
@@ -179,7 +175,8 @@ app.post("/upload", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// GET /ids -> Pull database directory indices
+
+// GET /ids -> Return array list of raw resource strings
 app.get("/ids", async (req, res) => {
   try {
     const db = await getDB();
@@ -189,31 +186,29 @@ app.get("/ids", async (req, res) => {
   }
 });
 
-// NEW ROUTE: Returns all videos paired directly with their titles and metadata
+// GET /feed -> Combined custom titles matched directly with database tracking configurations
 app.get("/feed", async (req, res) => {
   try {
     const db = await getDB();
-    
-    // Map the database into a clean array of objects containing the ID and its details
     const feed = db.ids.map(id => ({
       id: id,
-      title: db.videos[id]?.title || id, // Fallback to ID if old video lacks a title
+      title: db.videos[id]?.title || id,
       uploadedAt: db.videos[id]?.uploadedAt || 0
     }));
-    
     res.json({ feed });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /:id/video -> High Performance local disk streaming bypasses HF download walls
-// FIXED: Supports HTTP Range Requests for instant skipping, fast-forwarding, and scrubbing
+// GET /:id/video -> Multi-chunk HTTP Range routing for timeline scrub skipping 
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Video metadata entry missing." });
+    if (!entry) {
+      return res.status(404).json({ error: "Video metadata entry missing." });
+    }
 
     const localFilePath = path.join(TEMP_DIR, entry.folder, entry.videoFile);
 
@@ -225,21 +220,23 @@ app.get("/:id/video", async (req, res) => {
     const fileSize = stat.size;
     const range = req.headers.range;
 
-    // If the browser sends a Range header (i.e., user is trying to skip or buffer ahead)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Range, Content-Type");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length");
+
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
 
       if (start >= fileSize) {
-        res.status(416).send("Requested range not satisfiable\n" + start + " >= " + fileSize);
-        return;
+        return res.status(416).send(`Requested range not satisfiable\n${start} >= ${fileSize}`);
       }
 
       const chunksize = (end - start) + 1;
       const file = fs.createReadStream(localFilePath, { start, end });
       
-      // 206 Partial Content tells the browser it's getting exactly the chunk it asked for
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
         "Accept-Ranges": "bytes",
@@ -247,10 +244,24 @@ app.get("/:id/video", async (req, res) => {
         "Content-Type": "video/mp4",
       });
       
-      file.pipe(res);
+      return file.pipe(res);
+    } else {
+      res.writeHead(200, {
+        "Content-Length": fileSize,
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes"
+      });
+      return fs.createReadStream(localFilePath).pipe(res);
     }
+  } catch (err) {
+    console.error("Local Video Streaming Error:", err);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+});
 
-// GET /:id/thumbnail -> High Performance local image disk streaming
+// GET /:id/thumbnail -> Local graphic streaming
 app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
@@ -270,7 +281,9 @@ app.get("/:id/thumbnail", async (req, res) => {
     fs.createReadStream(localFilePath).pipe(res);
   } catch (err) {
     console.error("Local Thumbnail Streaming Error:", err);
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
