@@ -10,7 +10,7 @@ const fetch = (...args) =>
 
 const app = express();
 
-// Allow requests from any origin
+// 1. CORS Global Configuration Policy Layer
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -19,10 +19,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Restored your 1gb JSON ceiling
+// 2. Base64 Parse Cap Layer
 app.use(express.json({ limit: "1gb" }));
 
-// Surface JSON body-parse errors
+// Catch-all payload verification
 app.use((err, req, res, next) => {
   if (err) {
     console.error("Body parse error:", err.message);
@@ -31,11 +31,11 @@ app.use((err, req, res, next) => {
   next();
 });
 
+// Health Probe
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const HF_TOKEN = process.env.HF_TOKEN;
 const HF_REPO = process.env.HF_DATASET_REPO; 
-const HF_RAW = `https://huggingface.co/datasets/${HF_REPO}/resolve/main`;
 const TEMP_DIR = "/tmp/hf-video-repo";
 
 if (!HF_TOKEN || !HF_REPO) {
@@ -43,7 +43,7 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
-// ── Git + HuggingFace + LFS helpers ──────────────────────────────────────────
+// ── Git + HuggingFace + LFS Environment Systems ──────────────────────────────
 
 async function initGitRepo() {
   if (fs.existsSync(TEMP_DIR)) {
@@ -67,18 +67,17 @@ async function initGitRepo() {
 
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
   try {
-    await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
+    await execAsync::(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
   } catch (err) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 
-  // Set configs
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
 
-  // CRITICAL: Initialize Git LFS inside the repo and track video/image extensions
+  // Inject Git LFS patterns to make pushing scalable behind the scenes
   try {
     await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
@@ -86,7 +85,7 @@ async function initGitRepo() {
     await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git commit -m "Initialize Git LFS tracking rules"`, { timeout: 10000 });
   } catch (lfsErr) {
-    console.warn("LFS setup warning (might already be configured):", lfsErr.message);
+    console.warn("LFS baseline track update skipped:", lfsErr.message);
   }
 }
 
@@ -103,19 +102,13 @@ async function gitCommitAndPush(filePath, message) {
       await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
     } catch (pullErr) {}
     
-    // Increased timeout to 120 seconds because LFS uploads take longer to push raw bytes
+    // 120 second extended window for LFS byte processing
     await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 120000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
     if (errMsg.includes("nothing to commit") || errMsg.includes("no changes added")) return;
     throw err;
   }
-}
-
-async function hfDownload(filePath) {
-  return await fetch(`${HF_RAW}/${filePath}?raw=true`, {
-    headers: { Authorization: `Bearer ${HF_TOKEN}` },
-  });
 }
 
 async function getDB() {
@@ -132,9 +125,9 @@ async function saveDB(db) {
   await gitCommitAndPush("database.json", `Update database: ${new Date().toISOString()}`);
 }
 
-// ── Endpoints ────────────────────────────────────────────────────────────────
+// ── Production Interface Routes ──────────────────────────────────────────────
 
-// POST /upload (Restored to original Base64/DataURI method)
+// POST /upload -> Reverted workflow accepting pure Base64 strings
 app.post("/upload", async (req, res) => {
   try {
     const { videoData, thumbnailData } = req.body;
@@ -148,7 +141,7 @@ app.post("/upload", async (req, res) => {
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    // Strip data URI prefixes
+    // Drop regex data patterns
     const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
     const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
@@ -159,7 +152,6 @@ app.post("/upload", async (req, res) => {
     fs.writeFileSync(videoPath, Buffer.from(videoBase64, "base64"));
     fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
 
-    // Push files to HuggingFace (Git LFS will pick them up automatically now)
     await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
     await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
 
@@ -175,6 +167,7 @@ app.post("/upload", async (req, res) => {
   }
 });
 
+// GET /ids -> Pull database directory indices
 app.get("/ids", async (req, res) => {
   try {
     const db = await getDB();
@@ -184,36 +177,50 @@ app.get("/ids", async (req, res) => {
   }
 });
 
-app.get("/:id/video/datauri", async (req, res) => {
+// GET /:id/video -> High Performance local disk streaming bypasses HF download walls
+app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Video not found" });
+    if (!entry) return res.status(404).json({ error: "Video metadata entry missing." });
 
-    const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
-    if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
+    const localFilePath = path.join(TEMP_DIR, entry.folder, entry.videoFile);
 
-    const buffer = await hfRes.buffer();
-    const base64 = buffer.toString("base64");
-    res.json({ datauri: `data:video/mp4;base64,${base64}` });
+    if (!fs.existsSync(localFilePath)) {
+      return res.status(404).json({ error: "Video file missing on local server clone directory." });
+    }
+
+    const stat = fs.statSync(localFilePath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", stat.size);
+
+    fs.createReadStream(localFilePath).pipe(res);
   } catch (err) {
+    console.error("Local Video Streaming Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/:id/thumbnail/datauri", async (req, res) => {
+// GET /:id/thumbnail -> High Performance local image disk streaming
+app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Video not found" });
+    if (!entry) return res.status(404).json({ error: "Thumbnail metadata entry missing." });
 
-    const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
-    if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
+    const localFilePath = path.join(TEMP_DIR, entry.folder, entry.thumbnailFile);
 
-    const buffer = await hfRes.buffer();
-    const base64 = buffer.toString("base64");
-    res.json({ datauri: `data:image/png;base64,${base64}` });
+    if (!fs.existsSync(localFilePath)) {
+      return res.status(404).json({ error: "Thumbnail file missing on local server clone directory." });
+    }
+
+    const stat = fs.statSync(localFilePath);
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Length", stat.size);
+
+    fs.createReadStream(localFilePath).pipe(res);
   } catch (err) {
+    console.error("Local Thumbnail Streaming Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
