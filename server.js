@@ -3,6 +3,10 @@ const fs = require('fs');
 const path = require('path');
 const { downloadFile, uploadFile } = require('@huggingface/hub');
 
+const express = require('express');
+const cors = require('cors'); // <-- Add this line
+const { downloadFile, uploadFile } = require('@huggingface/hub');
+
 const app = express();
 
 // Increase JSON payload limits since DataURIs for video can be massive
