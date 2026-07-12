@@ -1,6 +1,13 @@
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const { exec } = require("child_process");
+const { promisify } = require("util");
+
+const execAsync = promisify(exec);
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
+
 const app = express();
 
 // Allow requests from any origin (needed if you're calling this from a browser page)
@@ -28,8 +35,8 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const HF_TOKEN = process.env.HF_TOKEN;
 const HF_REPO = process.env.HF_DATASET_REPO; // e.g. "username/my-videos"
-const HF_API = `https://huggingface.co/api/datasets/${HF_REPO}`;
 const HF_RAW = `https://huggingface.co/datasets/${HF_REPO}/resolve/main`;
+const TEMP_DIR = "/tmp/hf-video-repo";
 
 if (!HF_TOKEN || !HF_REPO) {
   console.error(
@@ -39,43 +46,44 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
-// ── HuggingFace helpers ──────────────────────────────────────────────────────
+// ── Git + HuggingFace helpers ────────────────────────────────────────────────
 
-async function hfUpload(filePath, content, isBase64 = false) {
-  // filePath: path inside the repo, e.g. "database.json" or "media/video-123/video.mp4"
-  // content: string (for JSON) or base64 string (for binary)
-  // Use the commit API (replaces deprecated upload endpoint)
-  
-  const buffer = isBase64 ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
-  const base64Encoded = buffer.toString("base64");
+async function initGitRepo() {
+  // Clone or initialize the HF dataset repo
+  if (fs.existsSync(TEMP_DIR)) return; // Already initialized
 
-  const operations = [
-    {
-      operation: "add",
-      path_in_repo: filePath,
-      raw: base64Encoded,
-    },
-  ];
-
-  const res = await fetch(
-    `https://huggingface.co/api/datasets/${HF_REPO}/commit`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${HF_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        commit_message: `Upload ${filePath}`,
-        operations,
-      }),
-    }
-  );
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HF commit failed for ${filePath}: ${res.status} ${text}`);
+  const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+  try {
+    await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
+    console.log("Cloned HF dataset repo");
+  } catch (err) {
+    console.warn("Could not clone repo (might be empty):", err.message);
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+    await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
-  return res.json();
+}
+
+async function gitCommitAndPush(filePath, message) {
+  // Write and push a file to HF using git
+  const fullPath = path.join(TEMP_DIR, filePath);
+  const dirPath = path.dirname(fullPath);
+  
+  fs.mkdirSync(dirPath, { recursive: true });
+
+  try {
+    await execAsync(`cd ${TEMP_DIR} && git add "${filePath}"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git commit -m "${message}"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 60000 });
+    console.log(`✓ Pushed ${filePath} to HF`);
+  } catch (err) {
+    // "nothing to commit" is fine; some other errors are not
+    if (!err.message.includes("nothing to commit") && !err.message.includes("no changes added")) {
+      throw err;
+    }
+  }
 }
 
 async function hfDownload(filePath) {
@@ -87,14 +95,17 @@ async function hfDownload(filePath) {
 }
 
 async function getDB() {
-  const res = await hfDownload("database.json");
-  if (res.status === 404) return { ids: [], videos: {} };
-  if (!res.ok) throw new Error(`Failed to fetch database.json: ${res.status}`);
-  return res.json();
+  await initGitRepo();
+  const dbPath = path.join(TEMP_DIR, "database.json");
+  if (!fs.existsSync(dbPath)) return { ids: [], videos: {} };
+  return JSON.parse(fs.readFileSync(dbPath, "utf-8"));
 }
 
 async function saveDB(db) {
-  await hfUpload("database.json", JSON.stringify(db, null, 2));
+  await initGitRepo();
+  const dbPath = path.join(TEMP_DIR, "database.json");
+  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2), "utf-8");
+  await gitCommitAndPush("database.json", `Update database: ${new Date().toISOString()}`);
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
@@ -108,6 +119,8 @@ app.post("/upload", async (req, res) => {
       return res.status(400).json({ error: "videoData and thumbnailData are required" });
     }
 
+    await initGitRepo();
+
     const timestamp = Date.now();
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
@@ -116,9 +129,17 @@ app.post("/upload", async (req, res) => {
     const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
     const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
-    // Upload files to HuggingFace
-    await hfUpload(`${folder}/video.mp4`, videoBase64, true);
-    await hfUpload(`${folder}/thumbnail.png`, thumbBase64, true);
+    // Write files to temp repo
+    const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
+    const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
+    
+    fs.mkdirSync(path.dirname(videoPath), { recursive: true });
+    fs.writeFileSync(videoPath, Buffer.from(videoBase64, "base64"));
+    fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
+
+    // Push files to HuggingFace
+    await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
+    await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
 
     // Update database
     const db = await getDB();
