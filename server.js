@@ -10,6 +10,9 @@ const fetch = (...args) =>
 
 const app = express();
 
+// Global tracking variables to stop duplicate executions
+let isGitRepoInitialized = false;
+
 // 1. CORS Global Configuration Policy Layer
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -44,29 +47,20 @@ if (!HF_TOKEN || !HF_REPO) {
 }
 
 // ── Git + HuggingFace + LFS Environment Systems ──────────────────────────────
-let isGitRepoInitialized = false;
+
 async function initGitRepo() {
-  // If another request already initialized the repo, skip the Git commands entirely!
   if (isGitRepoInitialized) return;
 
   if (fs.existsSync(TEMP_DIR)) {
-    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-    
     try {
+      await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
+      await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
       await execAsync(`cd ${TEMP_DIR} && git remote get-url origin`, { timeout: 5000 });
-    } catch {
-      const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
-      await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
-    }
-    
-    try {
       await execAsync(`cd ${TEMP_DIR} && git fetch origin 2>&1`, { timeout: 20000 });
+      isGitRepoInitialized = true;
     } catch (err) {
-      console.warn("Could not fetch from remote:", err.message);
+      console.warn("Warm directory initialization notice:", err.message);
     }
-    
-    isGitRepoInitialized = true; // Mark as done
     return;
   }
 
@@ -79,10 +73,9 @@ async function initGitRepo() {
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 
-  await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
-  await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-
   try {
+    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git lfs track "*.png"`, { timeout: 10000 });
@@ -94,7 +87,7 @@ async function initGitRepo() {
     console.warn("LFS baseline track update skipped:", lfsErr.message);
   }
 
-  isGitRepoInitialized = true; // Mark as done
+  isGitRepoInitialized = true;
 }
 
 async function gitCommitAndPush(filePath, message) {
@@ -105,11 +98,9 @@ async function gitCommitAndPush(filePath, message) {
   try {
     await execAsync(`cd ${TEMP_DIR} && git add "${filePath}"`, { timeout: 10000 });
     await execAsync(`cd ${TEMP_DIR} && git commit -m "${message}"`, { timeout: 10000 });
-    
     try {
       await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
     } catch (pullErr) {}
-    
     await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 120000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
@@ -134,7 +125,6 @@ async function saveDB(db) {
 
 // ── Production Interface Routes ──────────────────────────────────────────────
 
-// POST /upload -> Accept title, video packet and graphic packets
 app.post("/upload", async (req, res) => {
   try {
     const { videoData, thumbnailData, title } = req.body;
@@ -167,13 +157,7 @@ app.post("/upload", async (req, res) => {
 
     const db = await getDB();
     db.ids.push(id);
-    db.videos[id] = { 
-      folder, 
-      videoFile: "video.mp4", 
-      thumbnailFile: thumbnailFilename, 
-      title: title, 
-      uploadedAt: timestamp 
-    };
+    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: thumbnailFilename, title, uploadedAt: timestamp };
     await saveDB(db);
 
     res.json({ id, title, folder });
@@ -183,7 +167,6 @@ app.post("/upload", async (req, res) => {
   }
 });
 
-// GET /ids -> Return array list of raw resource strings
 app.get("/ids", async (req, res) => {
   try {
     const db = await getDB();
@@ -193,7 +176,6 @@ app.get("/ids", async (req, res) => {
   }
 });
 
-// GET /feed -> Combined custom titles matched directly with database tracking configurations
 app.get("/feed", async (req, res) => {
   try {
     const db = await getDB();
@@ -208,20 +190,15 @@ app.get("/feed", async (req, res) => {
   }
 });
 
-// GET /:id/video -> High-compatibility range streaming with explicit global video header pinning
+// FIXED: Airtight chunk segment allocation ensures tracks do not drop down to audio mode
 app.get("/:id/video", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) {
-      return res.status(404).json({ error: "Video metadata entry missing." });
-    }
+    if (!entry) return res.status(404).json({ error: "Video metadata entry missing." });
 
     const localFilePath = path.join(TEMP_DIR, entry.folder, entry.videoFile);
-
-    if (!fs.existsSync(localFilePath)) {
-      return res.status(404).json({ error: "Video file missing on local server clone directory." });
-    }
+    if (!fs.existsSync(localFilePath)) return res.status(404).json({ error: "Video missing." });
 
     const stat = fs.statSync(localFilePath);
     const fileSize = stat.size;
@@ -231,67 +208,74 @@ app.get("/:id/video", async (req, res) => {
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Range, Content-Type");
     res.setHeader("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length");
-    res.setHeader("Content-Type", "video/mp4"); 
+    res.setHeader("Content-Type", "video/mp4");
 
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
 
-      if (start >= fileSize) {
-        return res.status(416).send(`Requested range not satisfiable\n${start} >= ${fileSize}`);
+      if (start >= fileSize || end >= fileSize) {
+        res.setHeader("Content-Range", `bytes */${fileSize}`);
+        return res.status(416).send("Requested range not satisfiable");
       }
 
       const chunksize = (end - start) + 1;
-      const file = fs.createReadStream(localFilePath, { start, end });
       
-      res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunksize,
-        "Content-Type": "video/mp4",
+      // Open direct file descriptor to force perfectly synchronized chunk reading
+      fs.open(localFilePath, "r", (err, fd) => {
+        if (err) return res.status(500).send(err.message);
+        
+        const buffer = Buffer.alloc(chunksize);
+        fs.read(fd, buffer, 0, chunksize, start, (readErr, bytesRead) => {
+          fs.close(fd, () => {}); // Safely clean up reference handles instantly
+          
+          if (readErr) return res.status(500).send(readErr.message);
+
+          res.writeHead(206, {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": bytesRead,
+            "Content-Type": "video/mp4",
+          });
+          res.end(buffer);
+        });
       });
-      
-      return file.pipe(res);
     } else {
       res.writeHead(200, {
         "Content-Length": fileSize,
         "Content-Type": "video/mp4",
         "Accept-Ranges": "bytes"
       });
-      return fs.createReadStream(localFilePath).pipe(res);
+      fs.createReadStream(localFilePath).pipe(res);
     }
   } catch (err) {
-    console.error("Local Video Streaming Error:", err);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: err.message });
-    }
+    console.error("Streaming Error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
-// GET /:id/thumbnail -> Local graphic streaming
 app.get("/:id/thumbnail", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry) return res.status(404).json({ error: "Thumbnail metadata entry missing." });
+    if (!entry) return res.status(404).json({ error: "Thumbnail entry missing." });
 
     const localFilePath = path.join(TEMP_DIR, entry.folder, entry.thumbnailFile);
+    if (!fs.existsSync(localFilePath)) return res.status(404).json({ error: "Thumbnail missing." });
 
-    if (!fs.existsSync(localFilePath)) {
-      return res.status(404).json({ error: "Thumbnail file missing on local server clone directory." });
-    }
+    const ext = path.extname(localFilePath).toLowerCase().replace(".", "");
+    const mimeType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : `image/${ext}`;
 
     const stat = fs.statSync(localFilePath);
-    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Type", mimeType);
     res.setHeader("Content-Length", stat.size);
+    res.setHeader("Access-Control-Allow-Origin", "*");
 
     fs.createReadStream(localFilePath).pipe(res);
   } catch (err) {
-    console.error("Local Thumbnail Streaming Error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message });
-    }
+    console.error("Thumbnail error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
