@@ -4,7 +4,6 @@ const path = require('path');
 const { downloadFile, uploadFile } = require('@huggingface/hub');
 
 const cors = require('cors'); // <-- Add this line
-const { downloadFile, uploadFile } = require('@huggingface/hub');
 
 const app = express();
 
