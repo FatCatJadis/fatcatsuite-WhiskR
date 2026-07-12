@@ -3,7 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const { downloadFile, uploadFile } = require('@huggingface/hub');
 
-const express = require('express');
 const cors = require('cors'); // <-- Add this line
 const { downloadFile, uploadFile } = require('@huggingface/hub');
 
