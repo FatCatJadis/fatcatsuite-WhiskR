@@ -3,7 +3,6 @@ const fs = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
-const multer = require("multer"); // CRITICAL: Added to handle binary file fields
 
 const execAsync = promisify(exec);
 const fetch = (...args) =>
@@ -11,9 +10,7 @@ const fetch = (...args) =>
 
 const app = express();
 
-// Safe storage allocation that captures chunks directly onto disk
-const upload = multer({ dest: "/tmp/uploads/" });
-
+// Allow requests from any origin
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -22,9 +19,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reduced down to 10mb because large files stream through multer, not JSON
-app.use(express.json({ limit: "10mb" }));
+// Restored your 1gb JSON ceiling
+app.use(express.json({ limit: "1gb" }));
 
+// Surface JSON body-parse errors
 app.use((err, req, res, next) => {
   if (err) {
     console.error("Body parse error:", err.message);
@@ -45,7 +43,7 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
-// ── Git + HuggingFace helpers ────────────────────────────────────────────────
+// ── Git + HuggingFace + LFS helpers ──────────────────────────────────────────
 
 async function initGitRepo() {
   if (fs.existsSync(TEMP_DIR)) {
@@ -76,8 +74,20 @@ async function initGitRepo() {
     await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
   }
 
+  // Set configs
   await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
+
+  // CRITICAL: Initialize Git LFS inside the repo and track video/image extensions
+  try {
+    await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.png"`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, { timeout: 10000 });
+    await execAsync(`cd ${TEMP_DIR} && git commit -m "Initialize Git LFS tracking rules"`, { timeout: 10000 });
+  } catch (lfsErr) {
+    console.warn("LFS setup warning (might already be configured):", lfsErr.message);
+  }
 }
 
 async function gitCommitAndPush(filePath, message) {
@@ -93,7 +103,8 @@ async function gitCommitAndPush(filePath, message) {
       await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
     } catch (pullErr) {}
     
-    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 90000 });
+    // Increased timeout to 120 seconds because LFS uploads take longer to push raw bytes
+    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 120000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
     if (errMsg.includes("nothing to commit") || errMsg.includes("no changes added")) return;
@@ -123,14 +134,12 @@ async function saveDB(db) {
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
 
-// POST /upload -> Processes multipart files independently
-app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thumbnail", maxCount: 1 }]), async (req, res) => {
+// POST /upload (Restored to original Base64/DataURI method)
+app.post("/upload", async (req, res) => {
   try {
-    const hasVideo = req.files && req.files.video && req.files.video[0];
-    const hasThumbnail = req.files && req.files.thumbnail && req.files.thumbnail[0];
-
-    if (!hasVideo && !hasThumbnail) {
-      return res.status(400).json({ error: "Payload empty. Provide a 'video', a 'thumbnail', or both." });
+    const { videoData, thumbnailData } = req.body;
+    if (!videoData || !thumbnailData) {
+      return res.status(400).json({ error: "videoData and thumbnailData are required" });
     }
 
     await initGitRepo();
@@ -139,31 +148,27 @@ app.post("/upload", upload.fields([{ name: "video", maxCount: 1 }, { name: "thum
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
-    const videoFile = hasVideo ? "video.mp4" : null;
-    const thumbnailFile = hasThumbnail ? "thumbnail.png" : null;
+    // Strip data URI prefixes
+    const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
+    const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
-    if (hasVideo) {
-      const rawVideo = req.files.video[0];
-      const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
-      fs.mkdirSync(path.dirname(videoPath), { recursive: true });
-      fs.renameSync(rawVideo.path, videoPath); // Relocates file chunk stream safely
-      await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
-    }
+    const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
+    const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
+    
+    fs.mkdirSync(path.dirname(videoPath), { recursive: true });
+    fs.writeFileSync(videoPath, Buffer.from(videoBase64, "base64"));
+    fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
 
-    if (hasThumbnail) {
-      const rawThumbnail = req.files.thumbnail[0];
-      const thumbPath = path.join(TEMP_DIR, folder, "thumbnail.png");
-      fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
-      fs.renameSync(rawThumbnail.path, thumbPath);
-      await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
-    }
+    // Push files to HuggingFace (Git LFS will pick them up automatically now)
+    await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
+    await gitCommitAndPush(`${folder}/thumbnail.png`, `Upload thumbnail ${id}`);
 
     const db = await getDB();
     db.ids.push(id);
-    db.videos[id] = { folder, videoFile, thumbnailFile, uploadedAt: timestamp };
+    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: "thumbnail.png", uploadedAt: timestamp };
     await saveDB(db);
 
-    res.json({ id, folder, videoUploaded: !!hasVideo, thumbnailUploaded: !!hasThumbnail });
+    res.json({ id, folder });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -179,37 +184,35 @@ app.get("/ids", async (req, res) => {
   }
 });
 
-// GET endpoints now stream binary directly back rather than converting to heavy dataURIs
-app.get("/:id/video", async (req, res) => {
+app.get("/:id/video/datauri", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.videoFile) return res.status(404).json({ error: "No video file found for this entry." });
+    if (!entry) return res.status(404).json({ error: "Video not found" });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.videoFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
 
-    res.setHeader("Content-Type", "video/mp4");
-    if (hfRes.headers.get("content-length")) {
-      res.setHeader("Content-Length", hfRes.headers.get("content-length"));
-    }
-    hfRes.body.pipe(res);
+    const buffer = await hfRes.buffer();
+    const base64 = buffer.toString("base64");
+    res.json({ datauri: `data:video/mp4;base64,${base64}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/:id/thumbnail", async (req, res) => {
+app.get("/:id/thumbnail/datauri", async (req, res) => {
   try {
     const db = await getDB();
     const entry = db.videos[req.params.id];
-    if (!entry || !entry.thumbnailFile) return res.status(404).json({ error: "No thumbnail file found for this entry." });
+    if (!entry) return res.status(404).json({ error: "Video not found" });
 
     const hfRes = await hfDownload(`${entry.folder}/${entry.thumbnailFile}`);
     if (!hfRes.ok) return res.status(404).json({ error: "File not found in storage" });
 
-    res.setHeader("Content-Type", "image/png");
-    hfRes.body.pipe(res);
+    const buffer = await hfRes.buffer();
+    const base64 = buffer.toString("base64");
+    res.json({ datauri: `data:image/png;base64,${base64}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
