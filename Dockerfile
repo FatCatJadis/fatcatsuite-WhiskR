@@ -13,4 +13,5 @@ COPY server1.js ./
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+# Cleans up any leftover/corrupted git repository before starting the server
+CMD ["sh", "-c", "rm -rf /tmp/hf-video-repo && node server.js"]
