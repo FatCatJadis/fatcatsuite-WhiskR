@@ -79,6 +79,7 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const HF_TOKEN = process.env.HF_TOKEN;
 const HF_REPO = process.env.HF_DATASET_REPO;
+const HF_REMOTE_URL = process.env.HF_GIT_REMOTE_URL || `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
 const TEMP_DIR = process.env.MEDIA_REPO_DIR || "/tmp/hf-video-repo";
 const VIEW_DEDUPE_MS = 15 * 60 * 1000;
 const recentViews = new Map();
@@ -109,7 +110,7 @@ function clearRepositoryLock() {
 
 async function initializeGitRepo() {
   await lfsInstallPromise;
-  const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+  const cloneUrl = HF_REMOTE_URL;
   const gitDir = path.join(TEMP_DIR, ".git");
 
   if (fs.existsSync(gitDir)) {
@@ -199,6 +200,37 @@ async function performGitCommitAndPush(filePath, message) {
   }
 }
 
+const mediaRestorePromises = new Map();
+function restoreMediaFile(relativePath) {
+  const gitPath = String(relativePath || "").replace(/\\/g, "/");
+  if (!gitPath || gitPath.includes("..") || !/^[A-Za-z0-9._/-]+$/.test(gitPath)) {
+    return Promise.resolve(false);
+  }
+  if (mediaRestorePromises.has(gitPath)) return mediaRestorePromises.get(gitPath);
+
+  const targetPath = path.resolve(TEMP_DIR, gitPath);
+  const repoRoot = `${path.resolve(TEMP_DIR)}${path.sep}`;
+  if (!targetPath.startsWith(repoRoot)) return Promise.resolve(false);
+
+  const restore = initGitRepo()
+    .then(() => enqueueRepositoryOperation(async () => {
+      clearRepositoryLock();
+      await execAsync(`git -C "${TEMP_DIR}" fetch origin main --prune 2>&1`, { timeout: 60000 });
+      await execAsync(`git -C "${TEMP_DIR}" checkout origin/main -- "${gitPath}" 2>&1`, { timeout: 30000 });
+      await execAsync(`git -C "${TEMP_DIR}" lfs pull origin main --include="${gitPath}" 2>&1`, { timeout: 180000 });
+      await execAsync(`git -C "${TEMP_DIR}" lfs checkout "${gitPath}" 2>&1`, { timeout: 120000 });
+      return fs.existsSync(targetPath);
+    }))
+    .catch(err => {
+      console.warn(`Could not restore media file ${gitPath}:`, err.message);
+      return false;
+    })
+    .finally(() => mediaRestorePromises.delete(gitPath));
+
+  mediaRestorePromises.set(gitPath, restore);
+  return restore;
+}
+
 function opaqueLegacyKey(value) {
   const existing = String(value || "").trim();
   if (!existing) return null;
@@ -245,7 +277,20 @@ function normalizeDB(value) {
         clientKey: opaqueLegacyKey(comment?.clientKey || comment?.userId || `comment:${id}:${index}`),
         nickname,
         text: String(comment?.text || "").trim().slice(0, 500),
-        createdAt: Number(comment?.createdAt) || 0
+        createdAt: Number(comment?.createdAt) || 0,
+        replies: (Array.isArray(comment?.replies) ? comment.replies : []).map((reply, replyIndex) => {
+          const replyLegacyUser = reply?.userId ? legacyUsers[reply.userId] : null;
+          const replyNickname = String(
+            reply?.nickname || replyLegacyUser?.displayName || replyLegacyUser?.username || "Guest"
+          ).trim().slice(0, 24) || "Guest";
+          return {
+            id: String(reply?.id || `reply-legacy-${id}-${index}-${replyIndex}`),
+            clientKey: opaqueLegacyKey(reply?.clientKey || reply?.userId || `reply:${id}:${index}:${replyIndex}`),
+            nickname: replyNickname,
+            text: String(reply?.text || "").trim().slice(0, 500),
+            createdAt: Number(reply?.createdAt) || 0
+          };
+        }).filter(reply => reply.text)
       };
     }).filter(comment => comment.text);
   }
@@ -338,10 +383,24 @@ function serializeVideo(db, id, clientKey = null) {
     description: video.description || "",
     type: video.type,
     uploadedAt: video.uploadedAt,
-    stats: { likes: likes.length, comments: comments.length, views: video.viewCount || 0 },
+    stats: { likes: likes.length, comments: countComments(comments), views: video.viewCount || 0 },
     liked: Boolean(clientKey && likes.includes(clientKey)),
     videoUrl: `/${encodeURIComponent(id)}/video`,
     thumbnailUrl: `/${encodeURIComponent(id)}/thumbnail`
+  };
+}
+
+function countComments(comments) {
+  return comments.reduce((total, comment) => total + 1 + (Array.isArray(comment.replies) ? comment.replies.length : 0), 0);
+}
+
+function serializeReply(reply, clientKey = null) {
+  return {
+    id: reply.id,
+    text: reply.text,
+    createdAt: reply.createdAt,
+    author: { id: null, username: reply.nickname, displayName: reply.nickname, avatarUrl: "" },
+    isOwn: Boolean(clientKey && reply.clientKey === clientKey)
   };
 }
 
@@ -351,7 +410,8 @@ function serializeComment(comment, clientKey = null) {
     text: comment.text,
     createdAt: comment.createdAt,
     author: { id: null, username: comment.nickname, displayName: comment.nickname, avatarUrl: "" },
-    isOwn: Boolean(clientKey && comment.clientKey === clientKey)
+    isOwn: Boolean(clientKey && comment.clientKey === clientKey),
+    replies: (comment.replies || []).map(reply => serializeReply(reply, clientKey))
   };
 }
 
@@ -598,7 +658,7 @@ app.get("/videos/:id/comments", route(async (req, res) => {
   const comments = [...(db.comments[req.params.id] || [])]
     .sort((a, b) => Number(b.createdAt) - Number(a.createdAt))
     .map(comment => serializeComment(comment, clientKey));
-  res.json({ comments, count: comments.length });
+  res.json({ comments, count: countComments(db.comments[req.params.id] || []) });
 }));
 
 app.post("/videos/:id/comments", route(async (req, res) => {
@@ -617,10 +677,38 @@ app.post("/videos/:id/comments", route(async (req, res) => {
       clientKey,
       nickname,
       text,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      replies: []
     };
     comments.push(comment);
-    return { comment: serializeComment(comment, clientKey), count: comments.length };
+    return { comment: serializeComment(comment, clientKey), count: countComments(comments) };
+  });
+  res.status(201).json(result);
+}));
+
+app.post("/videos/:id/comments/:commentId/replies", route(async (req, res) => {
+  const clientKey = anonymousClientKey(req, true);
+  const text = String(req.body?.text || "").trim();
+  const nickname = String(req.body?.nickname || "").trim();
+  if (!text || text.length > 500) throw apiError(400, "Reply must be 1-500 characters.");
+  if (nickname.length < 2 || nickname.length > 24 || /[\u0000-\u001f\u007f]/.test(nickname)) {
+    throw apiError(400, "Nickname must be 2-24 printable characters.");
+  }
+  const result = await mutateDB(db => {
+    if (!db.videos[req.params.id]) throw apiError(404, "Video not found.");
+    const comments = db.comments[req.params.id] || (db.comments[req.params.id] = []);
+    const comment = comments.find(item => item.id === req.params.commentId);
+    if (!comment) throw apiError(404, "Comment not found.");
+    const replies = Array.isArray(comment.replies) ? comment.replies : (comment.replies = []);
+    const reply = {
+      id: `reply-${crypto.randomUUID()}`,
+      clientKey,
+      nickname,
+      text,
+      createdAt: Date.now()
+    };
+    replies.push(reply);
+    return { reply: serializeReply(reply, clientKey), count: countComments(comments) };
   });
   res.status(201).json(result);
 }));
@@ -660,7 +748,8 @@ app.get("/:id/video", route(async (req, res) => {
   const entry = db.videos[req.params.id];
   if (!entry) throw apiError(404, "Video metadata entry missing.");
   const localFilePath = path.join(TEMP_DIR, entry.folder, entry.videoFile);
-  if (!fs.existsSync(localFilePath)) throw apiError(404, "Video file missing on local server clone directory.");
+  if (!fs.existsSync(localFilePath)) await restoreMediaFile(path.join(entry.folder, entry.videoFile));
+  if (!fs.existsSync(localFilePath)) throw apiError(404, "Video file is not present in the media repository.");
   const fileSize = fs.statSync(localFilePath).size;
   const range = req.headers.range;
   if (!range) {
@@ -707,7 +796,8 @@ app.get("/:id/thumbnail", route(async (req, res) => {
   const entry = db.videos[req.params.id];
   if (!entry) throw apiError(404, "Thumbnail metadata entry missing.");
   const localFilePath = path.join(TEMP_DIR, entry.folder, entry.thumbnailFile);
-  if (!fs.existsSync(localFilePath)) throw apiError(404, "Thumbnail file missing on local server clone directory.");
+  if (!fs.existsSync(localFilePath)) await restoreMediaFile(path.join(entry.folder, entry.thumbnailFile));
+  if (!fs.existsSync(localFilePath)) throw apiError(404, "Thumbnail is not present in the media repository.");
   const mimeTypes = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
     ".gif": "image/gif", ".bmp": "image/bmp", ".avif": "image/avif", ".tif": "image/tiff", ".tiff": "image/tiff"
