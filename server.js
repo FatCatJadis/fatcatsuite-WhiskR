@@ -13,6 +13,9 @@ const app = express();
 // Global tracking variables to stop duplicate executions
 let isGitRepoInitialized = false;
 
+// Job tracking: upload_job_<timestamp> -> { status, error, result }
+const uploadJobs = {};
+
 // 1. CORS Global Configuration Policy Layer
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -153,20 +156,21 @@ async function saveDB(db) {
 
 // ── Production Interface Routes ──────────────────────────────────────────────
 
-// POST /upload -> Accepts payload, encodes to uniform H.264 web-standard via FFmpeg, and commits to HF
-app.post("/upload", async (req, res) => {
+// Background worker: does actual ffmpeg transcoding + git push (can take minutes)
+async function processUploadJob(jobId, videoData, thumbnailData, title) {
   try {
-    const { videoData, thumbnailData, title } = req.body;
-    if (!videoData || !thumbnailData || !title) {
-      return res.status(400).json({ error: "videoData, thumbnailData, and title are required." });
-    }
+    uploadJobs[jobId].status = "processing";
+    uploadJobs[jobId].progress = "Initializing...";
 
     await initGitRepo();
 
-    const timestamp = Date.now();
-    const id = `video-${timestamp}`;
-    const folder = `media/${id}`;
+    // Extract timestamp from jobId
+    const timestamp = parseInt(jobId.replace("upload_job_", ""));
+    const videoId = `video-${timestamp}`;
+    const folder = `media/${videoId}`;
 
+    uploadJobs[jobId].progress = "Parsing files...";
+    
     // Setup base extensions and filenames
     const matches = thumbnailData.match(/^data:image\/([a-zA-Z0-9+.#]+);base64,/);
     const extension = matches && matches[1] ? matches[1] : "png";
@@ -185,66 +189,42 @@ app.post("/upload", async (req, res) => {
     const thumbPath = path.join(folderPath, thumbnailFilename);
     
     // Save the raw incoming files to local scratch disk spaces
+    uploadJobs[jobId].progress = "Writing files...";
     fs.writeFileSync(rawInputVideoPath, Buffer.from(videoBase64, "base64"));
     fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
 
-    console.log(`🎬 Commencing server-side FFmpeg normalization for ${id}...`);
+    uploadJobs[jobId].progress = "Transcoding video (this may take a few minutes)...";
+    console.log(`🎬 Commencing FFmpeg normalization for ${videoId}...`);
     
-    // Core FFmpeg execution: normalizes codec profiling formats to web-standard baseline maps
-    // -y overrides existing files, +faststart optimizes layout for fast scrubbing
-    //
-    // IMPORTANT: "-profile:v baseline -level 3.0" was removed. Level 3.0 caps out around
-    // D1/NTSC resolution (~720x480). Modern phone footage is routinely 1080p/4K, so encoding
-    // at that resolution while tagging the stream as Level 3.0 produces a bitstream that
-    // technically violates the level's constraints. Lenient decoders play it anyway; some
-    // hardware decoders (notably on Chrome/Windows and some mobile browsers) reject the video
-    // track as invalid while still decoding the audio track fine -- which looks exactly like
-    // "the video loads but only plays audio." Using "high" profile with no hardcoded level
-    // (ffmpeg picks an appropriate level automatically based on the actual resolution) is
-    // broadly supported by all modern browsers and avoids this failure mode.
-    //
-    // "-map 0:v:0 -map 0:a:0?" explicitly selects the first real video stream and first audio
-    // stream (the "?" makes audio optional so silent videos don't fail). This guards against
-    // phone videos that embed a secondary cover-art/thumbnail image stream, which can otherwise
-    // confuse ffmpeg's automatic stream selection.
     const ffmpegCommand = `ffmpeg -y -i "${rawInputVideoPath}" -map 0:v:0 -map 0:a:0? -c:v libx264 -pix_fmt yuv420p -profile:v high -c:a aac -ac 2 -b:a 128k -movflags +faststart "${finalNormalizedVideoPath}"`;
     
-    try {
-      // Execute the transcoder compilation script (giving it up to 3 minutes for larger files)
-      await execAsync(ffmpegCommand, { timeout: 180000 });
-      console.log(`✅ FFmpeg Transcoding complete for ${id}! Clean layout saved.`);
+    await execAsync(ffmpegCommand, { timeout: 300000 }); // 5 min timeout for ffmpeg
+    console.log(`✅ FFmpeg Transcoding complete for ${videoId}!`);
 
-      // Validate the output actually contains a video stream. Without this check, a file that
-      // silently ended up audio-only would get pushed to HuggingFace and nobody would notice
-      // until a user hit play.
-      const { stdout: probeOut } = await execAsync(
-        `ffprobe -v error -select_streams v -show_entries stream=codec_type -of csv=p=0 "${finalNormalizedVideoPath}"`,
-        { timeout: 15000 }
-      );
-      if (!probeOut.includes("video")) {
-        throw new Error("Transcoded output has no video stream (source file may lack a decodable video track).");
-      }
-      
-      // Clean up the heavy raw input file so it doesn't get pushed to Hugging Face
-      if (fs.existsSync(rawInputVideoPath)) {
-        fs.unlinkSync(rawInputVideoPath);
-      }
-    } catch (ffmpegErr) {
-      console.error("❌ FFmpeg Transcoding Crash Error:", ffmpegErr);
-      return res.status(500).json({ 
-        error: "Server-side video transcoding processing failed. Ensure FFmpeg binaries are installed on the application environment hosting layer.", 
-        details: ffmpegErr.message 
-      });
+    // Validate output has video stream
+    const { stdout: probeOut } = await execAsync(
+      `ffprobe -v error -select_streams v -show_entries stream=codec_type -of csv=p=0 "${finalNormalizedVideoPath}"`,
+      { timeout: 15000 }
+    );
+    if (!probeOut.includes("video")) {
+      throw new Error("Transcoded output has no video stream.");
+    }
+    
+    // Clean up raw input
+    if (fs.existsSync(rawInputVideoPath)) {
+      fs.unlinkSync(rawInputVideoPath);
     }
 
-    // Ship the normalized asset bundles to HuggingFace
-    await gitCommitAndPush(`${folder}/video.mp4`, `Upload normalized video H.264 stream ${id}`);
-    await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail graphic ${id}`);
+    uploadJobs[jobId].progress = "Uploading to storage...";
+    // Ship to HuggingFace
+    await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${videoId}`);
+    await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail ${videoId}`);
 
-    // Update database pointer logs
+    uploadJobs[jobId].progress = "Updating database...";
+    // Update database
     const db = await getDB();
-    db.ids.push(id);
-    db.videos[id] = { 
+    db.ids.push(videoId);
+    db.videos[videoId] = { 
       folder, 
       videoFile: "video.mp4", 
       thumbnailFile: thumbnailFilename, 
@@ -253,11 +233,56 @@ app.post("/upload", async (req, res) => {
     };
     await saveDB(db);
 
-    res.json({ id, title, folder });
+    uploadJobs[jobId].status = "complete";
+    uploadJobs[jobId].result = { id: videoId, title, folder };
+    console.log(`✅ Upload job ${jobId} complete!`);
+  } catch (err) {
+    console.error(`❌ Upload job ${jobId} failed:`, err);
+    uploadJobs[jobId].status = "error";
+    uploadJobs[jobId].error = err.message;
+  }
+}
+
+// POST /upload -> Queue the upload and return immediately with jobId
+app.post("/upload", async (req, res) => {
+  try {
+    const { videoData, thumbnailData, title } = req.body;
+    if (!videoData || !thumbnailData || !title) {
+      return res.status(400).json({ error: "videoData, thumbnailData, and title are required." });
+    }
+
+    const jobId = `upload_job_${Date.now()}`;
+    uploadJobs[jobId] = { status: "queued", progress: "Queued..." };
+
+    // Start the background job without waiting for it
+    processUploadJob(jobId, videoData, thumbnailData, title).catch(err => {
+      console.error(`Background job ${jobId} crashed:`, err);
+    });
+
+    // Return immediately with the job ID so the browser doesn't hang
+    res.json({ jobId, status: "queued", message: "Upload queued. Poll /upload/status/:jobId to check progress." });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ error: err.message });
   }
+});
+
+// GET /upload/status/:jobId -> Check upload progress
+app.get("/upload/status/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  const job = uploadJobs[jobId];
+  
+  if (!job) {
+    return res.status(404).json({ error: "Job not found." });
+  }
+  
+  res.json({
+    jobId,
+    status: job.status,
+    progress: job.progress,
+    error: job.error || null,
+    result: job.result || null
+  });
 });
 app.get("/ids", async (req, res) => {
   try {
