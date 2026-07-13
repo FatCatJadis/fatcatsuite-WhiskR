@@ -205,6 +205,45 @@ async function processUploadJob(jobId, videoData, thumbnailData, title) {
     await execAsync(ffmpegCommand, { timeout: 60000 }); // 60 sec timeout (should finish in <10 sec)
     console.log(`✅ FFmpeg normalization complete for ${videoId}!`);
 
+    // Diagnostic: inspect the actual streams in the output file
+    uploadJobs[jobId].progress = "Validating output...";
+    let hasVideoStream = false;
+    try {
+      const { stdout: probeOut } = await execAsync(
+        `ffprobe -v error -show_entries stream=codec_type,codec_name -of csv=p=0 "${finalNormalizedVideoPath}"`,
+        { timeout: 15000 }
+      );
+      console.log(`FFprobe output for ${videoId}:`, probeOut);
+      uploadJobs[jobId].progress = `Streams detected: ${probeOut.trim()}`;
+      hasVideoStream = probeOut.includes("video");
+    } catch (probeErr) {
+      console.warn("ffprobe failed (non-fatal):", probeErr.message);
+    }
+
+    // If stream-copy left us with no video stream, the original file was probably audio-only
+    // or had codec issues. Fall back to actual H.264 re-encoding to fix it.
+    if (!hasVideoStream) {
+      console.warn(`❌ Stream-copy produced no video stream for ${videoId}. Falling back to H.264 re-encoding...`);
+      uploadJobs[jobId].progress = "Re-encoding to H.264 (this will take a few minutes)...";
+      
+      const fallbackCommand = `ffmpeg -y -i "${rawInputVideoPath}" -c:v libx264 -pix_fmt yuv420p -profile:v high -preset fast -c:a aac -ac 2 -b:a 128k -movflags +faststart "${finalNormalizedVideoPath}"`;
+      await execAsync(fallbackCommand, { timeout: 600000 }); // 10 min timeout
+      console.log(`✅ H.264 re-encoding complete for ${videoId}!`);
+      
+      // Re-check after re-encoding
+      try {
+        const { stdout: probeOut2 } = await execAsync(
+          `ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "${finalNormalizedVideoPath}"`,
+          { timeout: 15000 }
+        );
+        if (!probeOut2.includes("video")) {
+          throw new Error("Re-encoded output still has no video stream. Source file may be corrupted or audio-only.");
+        }
+      } catch (err) {
+        throw err;
+      }
+    }
+
     // Validate output has video stream
     const { stdout: probeOut } = await execAsync(
       `ffprobe -v error -select_streams v -show_entries stream=codec_type -of csv=p=0 "${finalNormalizedVideoPath}"`,
