@@ -2,7 +2,7 @@
 
 // Canonical Node entrypoint. The browser application lives in app.js and must
 // never be executed by Node.
-const { app } = require("./server (1).js");
+const { app } = require("./server1.js");
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
