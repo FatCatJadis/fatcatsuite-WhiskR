@@ -46,10 +46,24 @@ if (!HF_TOKEN || !HF_REPO) {
   process.exit(1);
 }
 
+// Install git-lfs globally at boot, BEFORE any clone happens. If "git lfs install" runs after
+// a clone, that clone happens without the LFS smudge filter registered, so any LFS-tracked
+// files (our .mp4s) get checked out as tiny pointer text files instead of actual video data --
+// a silent data-loss bug that would only surface when someone tried to play a video after a
+// fresh container start. This is awaited (not fire-and-forget) so initGitRepo can guarantee
+// it has completed before the first clone.
+const lfsInstallPromise = execAsync("git lfs install --skip-repo", { timeout: 10000 })
+  .then(() => console.log("✓ Git LFS installed globally"))
+  .catch((err) => console.warn("Warning: could not install git-lfs globally:", err.message));
+
 // ── Git + HuggingFace + LFS Environment Systems ──────────────────────────────
 
 async function initGitRepo() {
   if (isGitRepoInitialized) return;
+
+  // Make sure git-lfs is installed globally before touching any repo -- otherwise clones/fetches
+  // check out LFS pointer files instead of actual video/thumbnail bytes.
+  await lfsInstallPromise;
 
   if (fs.existsSync(TEMP_DIR)) {
     try {
@@ -57,6 +71,13 @@ async function initGitRepo() {
       await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
       await execAsync(`cd ${TEMP_DIR} && git remote get-url origin`, { timeout: 5000 });
       await execAsync(`cd ${TEMP_DIR} && git fetch origin 2>&1`, { timeout: 20000 });
+      // "git fetch" alone does not materialize LFS object content into the working tree --
+      // pull it explicitly so any existing files are real binaries, not pointer stubs.
+      try {
+        await execAsync(`cd ${TEMP_DIR} && git lfs pull origin main 2>&1`, { timeout: 60000 });
+      } catch (lfsPullErr) {
+        console.warn("git lfs pull (existing dir) notice:", lfsPullErr.message);
+      }
       isGitRepoInitialized = true;
     } catch (err) {
       console.warn("Warm directory initialization notice:", err.message);
@@ -67,6 +88,13 @@ async function initGitRepo() {
   const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
   try {
     await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
+    // Defensive: even though LFS was installed globally before this clone (so smudge filters
+    // should have applied automatically), explicitly pull to guarantee real content landed.
+    try {
+      await execAsync(`cd ${TEMP_DIR} && git lfs pull origin main 2>&1`, { timeout: 60000 });
+    } catch (lfsPullErr) {
+      console.warn("git lfs pull (fresh clone) notice:", lfsPullErr.message);
+    }
   } catch (err) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
@@ -164,12 +192,38 @@ app.post("/upload", async (req, res) => {
     
     // Core FFmpeg execution: normalizes codec profiling formats to web-standard baseline maps
     // -y overrides existing files, +faststart optimizes layout for fast scrubbing
-    const ffmpegCommand = `ffmpeg -y -i "${rawInputVideoPath}" -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.0 -c:a aac -ac 2 -b:a 128k -movflags +faststart "${finalNormalizedVideoPath}"`;
+    //
+    // IMPORTANT: "-profile:v baseline -level 3.0" was removed. Level 3.0 caps out around
+    // D1/NTSC resolution (~720x480). Modern phone footage is routinely 1080p/4K, so encoding
+    // at that resolution while tagging the stream as Level 3.0 produces a bitstream that
+    // technically violates the level's constraints. Lenient decoders play it anyway; some
+    // hardware decoders (notably on Chrome/Windows and some mobile browsers) reject the video
+    // track as invalid while still decoding the audio track fine -- which looks exactly like
+    // "the video loads but only plays audio." Using "high" profile with no hardcoded level
+    // (ffmpeg picks an appropriate level automatically based on the actual resolution) is
+    // broadly supported by all modern browsers and avoids this failure mode.
+    //
+    // "-map 0:v:0 -map 0:a:0?" explicitly selects the first real video stream and first audio
+    // stream (the "?" makes audio optional so silent videos don't fail). This guards against
+    // phone videos that embed a secondary cover-art/thumbnail image stream, which can otherwise
+    // confuse ffmpeg's automatic stream selection.
+    const ffmpegCommand = `ffmpeg -y -i "${rawInputVideoPath}" -map 0:v:0 -map 0:a:0? -c:v libx264 -pix_fmt yuv420p -profile:v high -c:a aac -ac 2 -b:a 128k -movflags +faststart "${finalNormalizedVideoPath}"`;
     
     try {
       // Execute the transcoder compilation script (giving it up to 3 minutes for larger files)
       await execAsync(ffmpegCommand, { timeout: 180000 });
       console.log(`✅ FFmpeg Transcoding complete for ${id}! Clean layout saved.`);
+
+      // Validate the output actually contains a video stream. Without this check, a file that
+      // silently ended up audio-only would get pushed to HuggingFace and nobody would notice
+      // until a user hit play.
+      const { stdout: probeOut } = await execAsync(
+        `ffprobe -v error -select_streams v -show_entries stream=codec_type -of csv=p=0 "${finalNormalizedVideoPath}"`,
+        { timeout: 15000 }
+      );
+      if (!probeOut.includes("video")) {
+        throw new Error("Transcoded output has no video stream (source file may lack a decodable video track).");
+      }
       
       // Clean up the heavy raw input file so it doesn't get pushed to Hugging Face
       if (fs.existsSync(rawInputVideoPath)) {
