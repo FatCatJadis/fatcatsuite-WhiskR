@@ -12,6 +12,7 @@ app.set("trust proxy", 1);
 
 // Global tracking variables to stop duplicate executions
 let isGitRepoInitialized = false;
+let repoInitPromise = null;
 
 // Job tracking: upload_job_<timestamp> -> { status, error, result }
 const uploadJobs = {};
@@ -99,78 +100,98 @@ const lfsInstallPromise = execAsync("git lfs install --skip-repo", { timeout: 10
 
 // ── Git + HuggingFace + LFS Environment Systems ──────────────────────────────
 
-async function initGitRepo() {
-  if (isGitRepoInitialized) return;
+function clearRepositoryLock() {
+  const lockPath = path.join(TEMP_DIR, ".git", "index.lock");
+  if (!fs.existsSync(lockPath)) return;
+  fs.unlinkSync(lockPath);
+  console.warn("Removed stale Git index lock from the media repository.");
+}
 
-  // Make sure git-lfs is installed globally before touching any repo -- otherwise clones/fetches
-  // check out LFS pointer files instead of actual video/thumbnail bytes.
+async function initializeGitRepo() {
   await lfsInstallPromise;
+  const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+  const gitDir = path.join(TEMP_DIR, ".git");
 
-  if (fs.existsSync(TEMP_DIR)) {
-    try {
-      await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
-      await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-      await execAsync(`cd ${TEMP_DIR} && git remote get-url origin`, { timeout: 5000 });
-      await execAsync(`cd ${TEMP_DIR} && git fetch origin 2>&1`, { timeout: 20000 });
-      // "git fetch" alone does not materialize LFS object content into the working tree --
-      // pull it explicitly so any existing files are real binaries, not pointer stubs.
-      try {
-        await execAsync(`cd ${TEMP_DIR} && git lfs pull origin main 2>&1`, { timeout: 60000 });
-      } catch (lfsPullErr) {
-        console.warn("git lfs pull (existing dir) notice:", lfsPullErr.message);
-      }
-      isGitRepoInitialized = true;
-    } catch (err) {
-      console.warn("Warm directory initialization notice:", err.message);
-    }
+  if (fs.existsSync(gitDir)) {
+    clearRepositoryLock();
+    await execAsync(`git -C "${TEMP_DIR}" config user.email "bot@render.com"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" config user.name "Video Upload Bot"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" remote set-url origin "${cloneUrl}"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" fetch origin main --prune 2>&1`, { timeout: 60000 });
+    // Fetching updates refs only. Reset the working tree so database.json and its
+    // referenced media always come from the same remote revision.
+    await execAsync(`git -C "${TEMP_DIR}" checkout -B main origin/main --force 2>&1`, { timeout: 30000 });
+    await execAsync(`git -C "${TEMP_DIR}" reset --hard origin/main 2>&1`, { timeout: 30000 });
+    await execAsync(`git -C "${TEMP_DIR}" lfs pull origin main 2>&1`, { timeout: 180000 });
+    await execAsync(`git -C "${TEMP_DIR}" lfs checkout 2>&1`, { timeout: 120000 });
+    isGitRepoInitialized = true;
     return;
   }
 
-  const cloneUrl = `https://x-access-token:${HF_TOKEN}@huggingface.co/datasets/${HF_REPO}`;
+  if (fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
   try {
-    await execAsync(`git clone ${cloneUrl} ${TEMP_DIR}`, { timeout: 30000 });
-    // Defensive: even though LFS was installed globally before this clone (so smudge filters
-    // should have applied automatically), explicitly pull to guarantee real content landed.
-    try {
-      await execAsync(`cd ${TEMP_DIR} && git lfs pull origin main 2>&1`, { timeout: 60000 });
-    } catch (lfsPullErr) {
-      console.warn("git lfs pull (fresh clone) notice:", lfsPullErr.message);
-    }
-  } catch (err) {
+    await execAsync(`git clone "${cloneUrl}" "${TEMP_DIR}"`, { timeout: 120000 });
+  } catch (cloneErr) {
+    // An empty dataset has no branch to clone yet; initialize it in place.
     fs.mkdirSync(TEMP_DIR, { recursive: true });
-    await execAsync(`cd ${TEMP_DIR} && git init`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git remote add origin ${cloneUrl}`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" init`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" remote add origin "${cloneUrl}"`, { timeout: 10000 });
   }
 
+  await execAsync(`git -C "${TEMP_DIR}" config user.email "bot@render.com"`, { timeout: 10000 });
+  await execAsync(`git -C "${TEMP_DIR}" config user.name "Video Upload Bot"`, { timeout: 10000 });
+  await execAsync(`git -C "${TEMP_DIR}" lfs install`, { timeout: 10000 });
+  await execAsync(`git -C "${TEMP_DIR}" lfs pull origin main 2>&1`, { timeout: 180000 }).catch(err => {
+    console.warn("Initial LFS pull notice:", err.message);
+  });
   try {
-    await execAsync(`cd ${TEMP_DIR} && git config user.email "bot@render.com"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git config user.name "Video Upload Bot"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs install`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.mp4"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.png"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.jpg"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git lfs track "*.jpeg"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git add .gitattributes`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git commit -m "Initialize Git LFS tracking rules"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" lfs track "*.mp4" "*.png" "*.jpg" "*.jpeg" "*.webp"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" add .gitattributes`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" commit -m "Initialize Git LFS tracking rules"`, { timeout: 10000 });
   } catch (lfsErr) {
-    console.warn("LFS baseline track update skipped:", lfsErr.message);
+    const details = `${lfsErr.message || ""}${lfsErr.stdout || ""}${lfsErr.stderr || ""}`;
+    if (!details.includes("nothing to commit")) console.warn("LFS baseline track update skipped:", lfsErr.message);
   }
-
   isGitRepoInitialized = true;
 }
 
-async function gitCommitAndPush(filePath, message) {
+function initGitRepo() {
+  if (isGitRepoInitialized) return Promise.resolve();
+  if (!repoInitPromise) {
+    repoInitPromise = initializeGitRepo().catch(err => {
+      repoInitPromise = null;
+      throw err;
+    });
+  }
+  return repoInitPromise;
+}
+
+let repositoryOperationQueue = Promise.resolve();
+function enqueueRepositoryOperation(work) {
+  const current = repositoryOperationQueue.then(work);
+  repositoryOperationQueue = current.then(() => undefined, () => undefined);
+  return current;
+}
+
+function gitCommitAndPush(filePath, message) {
+  return enqueueRepositoryOperation(() => performGitCommitAndPush(filePath, message));
+}
+
+async function performGitCommitAndPush(filePath, message) {
   const fullPath = path.join(TEMP_DIR, filePath);
   const dirPath = path.dirname(fullPath);
   fs.mkdirSync(dirPath, { recursive: true });
+  clearRepositoryLock();
 
   try {
-    await execAsync(`cd ${TEMP_DIR} && git add "${filePath}"`, { timeout: 10000 });
-    await execAsync(`cd ${TEMP_DIR} && git commit -m "${message}"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" add "${filePath}"`, { timeout: 10000 });
+    await execAsync(`git -C "${TEMP_DIR}" commit -m "${message}"`, { timeout: 10000 });
     try {
-      await execAsync(`cd ${TEMP_DIR} && git pull --rebase origin main 2>&1`, { timeout: 30000 });
-    } catch (pullErr) {}
-    await execAsync(`cd ${TEMP_DIR} && git push -u origin main 2>&1`, { timeout: 120000 });
+      await execAsync(`git -C "${TEMP_DIR}" pull --rebase origin main 2>&1`, { timeout: 60000 });
+    } catch (pullErr) {
+      console.warn("Remote rebase notice:", pullErr.message);
+    }
+    await execAsync(`git -C "${TEMP_DIR}" push -u origin main 2>&1`, { timeout: 180000 });
   } catch (err) {
     const errMsg = (err.message || "") + (err.stdout || "") + (err.stderr || "");
     if (errMsg.includes("nothing to commit") || errMsg.includes("no changes added")) return;
