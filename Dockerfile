@@ -2,8 +2,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-RUN apk update && apk add --no-cache git git-lfs
-RUN apk add --no-cache git
+# Installs git, git-lfs, and pre-compiles the system ffmpeg binary pack
+RUN apk update && apk add --no-cache git git-lfs ffmpeg
 
 COPY package.json ./
 RUN npm install --production
