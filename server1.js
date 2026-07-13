@@ -131,13 +131,30 @@ async function initializeGitRepo() {
 
   if (fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
   try {
-    await execAsync(`git clone "${cloneUrl}" "${TEMP_DIR}"`, { timeout: 120000 });
-  } catch (cloneErr) {
-    // An empty dataset has no branch to clone yet; initialize it in place.
-    fs.mkdirSync(TEMP_DIR, { recursive: true });
+  await execAsync(`git clone "${cloneUrl}" "${TEMP_DIR}"`, { timeout: 120000 });
+} catch (cloneErr) {
+  // An empty dataset has no branch to clone yet; initialize it in place.
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+  
+  // 1. Check if the .git folder already exists from a previous run
+  if (!fs.existsSync(path.join(TEMP_DIR, ".git"))) {
+    // If it doesn't exist, initialize cleanly
     await execAsync(`git -C "${TEMP_DIR}" init`, { timeout: 10000 });
     await execAsync(`git -C "${TEMP_DIR}" remote add origin "${cloneUrl}"`, { timeout: 10000 });
+  } else {
+    // 2. If it does exist, just update the URL safely instead of adding a duplicate origin
+    try {
+      await execAsync(`git -C "${TEMP_DIR}" remote set-url origin "${cloneUrl}"`, { timeout: 10000 });
+    } catch (remoteErr) {
+      // Fallback just in case origin wasn't the remote name configured
+      try {
+        await execAsync(`git -C "${TEMP_DIR}" remote add origin "${cloneUrl}"`, { timeout: 10000 });
+      } catch (e) {
+        // Absorb error if origin already exists
+      }
+    }
   }
+}
 
   await execAsync(`git -C "${TEMP_DIR}" config user.email "bot@render.com"`, { timeout: 10000 });
   await execAsync(`git -C "${TEMP_DIR}" config user.name "Video Upload Bot"`, { timeout: 10000 });
