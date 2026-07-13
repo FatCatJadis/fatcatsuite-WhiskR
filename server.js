@@ -125,6 +125,7 @@ async function saveDB(db) {
 
 // ── Production Interface Routes ──────────────────────────────────────────────
 
+// POST /upload -> Accepts payload, encodes to uniform H.264 web-standard via FFmpeg, and commits to HF
 app.post("/upload", async (req, res) => {
   try {
     const { videoData, thumbnailData, title } = req.body;
@@ -138,26 +139,64 @@ app.post("/upload", async (req, res) => {
     const id = `video-${timestamp}`;
     const folder = `media/${id}`;
 
+    // Setup base extensions and filenames
     const matches = thumbnailData.match(/^data:image\/([a-zA-Z0-9+.#]+);base64,/);
     const extension = matches && matches[1] ? matches[1] : "png";
     const thumbnailFilename = `thumbnail.${extension}`;
 
+    // Clear headers off incoming raw base64 data packets
     const videoBase64 = videoData.replace(/^data:[^;]+;base64,/, "");
     const thumbBase64 = thumbnailData.replace(/^data:[^;]+;base64,/, "");
 
-    const videoPath = path.join(TEMP_DIR, folder, "video.mp4");
-    const thumbPath = path.join(TEMP_DIR, folder, thumbnailFilename);
+    // Path maps
+    const folderPath = path.join(TEMP_DIR, folder);
+    fs.mkdirSync(folderPath, { recursive: true });
+
+    const rawInputVideoPath = path.join(folderPath, "input_raw.mp4");
+    const finalNormalizedVideoPath = path.join(folderPath, "video.mp4");
+    const thumbPath = path.join(folderPath, thumbnailFilename);
     
-    fs.mkdirSync(path.dirname(videoPath), { recursive: true });
-    fs.writeFileSync(videoPath, Buffer.from(videoBase64, "base64"));
+    // Save the raw incoming files to local scratch disk spaces
+    fs.writeFileSync(rawInputVideoPath, Buffer.from(videoBase64, "base64"));
     fs.writeFileSync(thumbPath, Buffer.from(thumbBase64, "base64"));
 
-    await gitCommitAndPush(`${folder}/video.mp4`, `Upload video ${id}`);
-    await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail ${id}`);
+    console.log(`🎬 Commencing server-side FFmpeg normalization for ${id}...`);
+    
+    // Core FFmpeg execution: normalizes codec profiling formats to web-standard baseline maps
+    // -y overrides existing files, +faststart optimizes layout for fast scrubbing
+    const ffmpegCommand = `ffmpeg -y -i "${rawInputVideoPath}" -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.0 -c:a aac -ac 2 -b:a 128k -movflags +faststart "${finalNormalizedVideoPath}"`;
+    
+    try {
+      // Execute the transcoder compilation script (giving it up to 3 minutes for larger files)
+      await execAsync(ffmpegCommand, { timeout: 180000 });
+      console.log(`✅ FFmpeg Transcoding complete for ${id}! Clean layout saved.`);
+      
+      // Clean up the heavy raw input file so it doesn't get pushed to Hugging Face
+      if (fs.existsSync(rawInputVideoPath)) {
+        fs.unlinkSync(rawInputVideoPath);
+      }
+    } catch (ffmpegErr) {
+      console.error("❌ FFmpeg Transcoding Crash Error:", ffmpegErr);
+      return res.status(500).json({ 
+        error: "Server-side video transcoding processing failed. Ensure FFmpeg binaries are installed on the application environment hosting layer.", 
+        details: ffmpegErr.message 
+      });
+    }
 
+    // Ship the normalized asset bundles to HuggingFace
+    await gitCommitAndPush(`${folder}/video.mp4`, `Upload normalized video H.264 stream ${id}`);
+    await gitCommitAndPush(`${folder}/${thumbnailFilename}`, `Upload thumbnail graphic ${id}`);
+
+    // Update database pointer logs
     const db = await getDB();
     db.ids.push(id);
-    db.videos[id] = { folder, videoFile: "video.mp4", thumbnailFile: thumbnailFilename, title, uploadedAt: timestamp };
+    db.videos[id] = { 
+      folder, 
+      videoFile: "video.mp4", 
+      thumbnailFile: thumbnailFilename, 
+      title: title, 
+      uploadedAt: timestamp 
+    };
     await saveDB(db);
 
     res.json({ id, title, folder });
@@ -166,7 +205,6 @@ app.post("/upload", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.get("/ids", async (req, res) => {
   try {
     const db = await getDB();
