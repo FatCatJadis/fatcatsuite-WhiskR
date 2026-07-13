@@ -372,4 +372,13 @@ app.get("/:id/thumbnail", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// The /upload endpoint does file writes + ffmpeg transcoding (up to 3 min) + several git
+// operations synchronously in a single request, which can easily take past a minute for real
+// videos. Node's default keepAliveTimeout (5s) and headersTimeout (60s) are too short for that
+// and can cause the connection to be dropped mid-request -- which shows up in the browser as a
+// bare "Failed to fetch" with no HTTP response at all. Raise both to give slow uploads room.
+server.keepAliveTimeout = 10 * 60 * 1000; // 10 minutes
+server.headersTimeout = 10 * 60 * 1000 + 1000; // must be greater than keepAliveTimeout
+server.requestTimeout = 0; // disable Node's per-request timeout entirely; ffmpeg/git steps govern their own timeouts
