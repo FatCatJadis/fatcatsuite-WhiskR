@@ -9,6 +9,7 @@ COPY package.json ./
 RUN npm install --production
 
 COPY server.js ./
+COPY server (1).js ./
 
 EXPOSE 3000
 
